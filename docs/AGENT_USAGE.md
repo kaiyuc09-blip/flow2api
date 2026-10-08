@@ -121,13 +121,15 @@ codex mcp add flow2api \
 Claude Code 可在目标项目中使用下面的 local 配置命令。参数根据 `claude mcp add --help` 核对。
 
 ```sh
-claude mcp add --scope local --transport stdio \
+claude mcp add flow2api --scope local --transport stdio \
   --env 'FLOW2API_BASE_URL=http://127.0.0.1:8000' \
   --env 'FLOW2API_API_KEY_FILE=/absolute/path/to/flow2api/private/api-key.txt' \
   --env 'FLOW2API_OUTPUT_DIR=/absolute/path/to/flow2api/media' \
-  flow2api -- '/absolute/path/to/flow2api/venv/bin/python' \
+  -- '/absolute/path/to/flow2api/venv/bin/python' \
   '/absolute/path/to/flow2api/repo/agent_mcp.py'
 ```
+
+服务名放在 `--env` 之前，避免被当前 Claude CLI 的多值环境变量参数误读为环境变量。注册后在同一项目运行 `claude mcp get flow2api`，应显示 `Local config` 和 `Connected`；这只验证 MCP 连接，不代表 Google 账号已连接或生成成功。
 
 使用接受标准 `mcpServers` JSON 配置的 Claude 客户端时，新增如下条目，保留原有服务器条目：
 
