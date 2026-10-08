@@ -5,6 +5,7 @@ import base64
 import json
 import math
 import mimetypes
+import os
 import time
 from urllib.parse import urlparse
 from pathlib import Path
@@ -21,7 +22,7 @@ from ..core.account_tiers import (
     supports_model_for_tier,
 )
 from .file_cache import FileCache
-from .model_capabilities import validate_generation_transport
+from .model_capabilities import validate_generation_transport, get_native_image_options, get_native_video_options
 from .generation_policy import GenerationOutcomeUnknown, no_submit_retry, submission_attempts
 
 
@@ -1369,6 +1370,47 @@ def _apply_current_flow_model_catalog():
 _apply_current_flow_model_catalog()
 
 
+def _register_native_image_models():
+    # These names select observed UI options, never inferred Google RPC keys.
+    for suffix, aspect in (
+        ("landscape", "IMAGE_ASPECT_RATIO_LANDSCAPE"),
+        ("portrait", "IMAGE_ASPECT_RATIO_PORTRAIT"),
+        ("square", "IMAGE_ASPECT_RATIO_SQUARE"),
+        ("four-three", "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE"),
+        ("three-four", "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR"),
+    ):
+        MODEL_CONFIG[f"gemini-nano-banana-2.1-{suffix}"] = {
+            "type": "image",
+            "model_name": None,
+            "generation_transport": "native_ui",
+            "native_model_label": "Nano Banana 2.1",
+            "aspect_ratio": aspect,
+            "listed": True,
+            "display_name": f"Nano Banana 2.1 · native UI · {suffix}",
+        }
+    MODEL_CONFIG["gemini-nano-banana-2.1"] = dict(MODEL_CONFIG["gemini-nano-banana-2.1-landscape"])
+
+
+_register_native_image_models()
+
+
+def _register_native_video_models():
+    # Each setting was observed in the UI; combinations and generation need live acceptance.
+    for suffix, aspect in (("landscape", "VIDEO_ASPECT_RATIO_LANDSCAPE"), ("portrait", "VIDEO_ASPECT_RATIO_PORTRAIT")):
+        for resolution in ("360p", "720p"):
+            for duration in (4, 6, 8, 10):
+                MODEL_CONFIG[f"native-omni-1.1-flash-{suffix}-{resolution}-{duration}s"] = {
+                    "type": "video", "video_type": "t2v", "model_key": None,
+                    "generation_transport": "native_ui", "native_model_label": "Omni 1.1 Flash",
+                    "aspect_ratio": aspect, "resolution": resolution, "duration_seconds": duration,
+                    "supports_images": False, "min_images": 0, "max_images": 0, "allow_tier_upgrade": False,
+                    "listed": True, "display_name": f"Omni 1.1 Flash · native UI · {suffix} · {resolution} · {duration}s",
+                }
+
+
+_register_native_video_models()
+
+
 def _known_video_model_keys() -> set[str]:
     return {
         cfg["model_key"]
@@ -1400,7 +1442,7 @@ class GenerationHandler:
         concurrency_manager,
         proxy_manager,
     ):
-        cache_dir = Path(__file__).resolve().parents[2] / "tmp"
+        cache_dir = Path(os.environ.get("FLOW2API_CACHE_DIR") or Path(__file__).resolve().parents[2] / "tmp")
         self.flow_client = flow_client
         self.token_manager = token_manager
         self.load_balancer = load_balancer
@@ -1523,6 +1565,8 @@ class GenerationHandler:
     def _resolve_video_model_key_for_tier(self, model_config: Dict[str, Any], user_tier: str) -> tuple[str, Optional[str]]:
         """根据账号层级调整视频模型 key。"""
         model_key = model_config["model_key"]
+        if model_config.get("generation_transport") == "native_ui":
+            return model_key, None
         allow_tier_upgrade = bool(model_config.get("allow_tier_upgrade", True))
 
         if user_tier == "PAYGATE_TIER_TWO":
@@ -1976,6 +2020,15 @@ class GenerationHandler:
         except Exception as e:
             error_msg = f"生成失败: {str(e)}"
             outcome_unknown = bool(getattr(e, "outcome_unknown", False))
+            native_credit_limits = None
+            credits_shown, max_credits = getattr(e, "credits_shown", None), getattr(e, "max_credits", None)
+            if (getattr(e, "code", None) == "native_credit_limit"
+                    and getattr(e, "submission_started", None) is False and not outcome_unknown
+                    and type(credits_shown) is int and type(max_credits) is int
+                    and 0 <= max_credits < credits_shown):
+                native_credit_limits = {"credits_shown": credits_shown, "max_credits": max_credits}
+                error_msg = "网页显示的点数超过本次授权预算；未提交生成，请确认费用后再决定是否发起新请求"
+            status_code = 400 if native_credit_limits is not None else 500
             debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
             if token:
                 if self._should_count_token_error(e):
@@ -1999,7 +2052,7 @@ class GenerationHandler:
                 request_operation if generation_type else "generate_unknown",
                 request_payload if "request_payload" in locals() else {"model": model},
                 {"error": error_msg, "performance": perf_trace},
-                500,
+                status_code,
                 duration,
                 log_id=request_log_state.get("id"),
                 status_text="failed",
@@ -2007,7 +2060,8 @@ class GenerationHandler:
             )
             if stream:
                 yield self._create_stream_chunk(f"错误: {error_msg}\n")
-            yield self._create_error_response(error_msg, status_code=500, outcome_unknown=outcome_unknown)
+            yield self._create_error_response(error_msg, status_code=status_code, outcome_unknown=outcome_unknown,
+                                             native_credit_limits=native_credit_limits)
         finally:
             if pending_token_state.get("active") and token and self.load_balancer:
                 await self.load_balancer.release_pending(
@@ -2030,7 +2084,7 @@ class GenerationHandler:
         reCAPTCHA 获取失败、验证码供应商错误、打码资源不足等问题通常不是账号本身异常；
         若将其纳入连续错误，会在回归测试或代理波动时把 token 自动打成 inactive。
         """
-        if getattr(error, "outcome_unknown", False):
+        if getattr(error, "outcome_unknown", False) or getattr(error, "submission_started", None) is False:
             return False
         error_text = str(error or "").strip().lower()
         if not error_text:
@@ -2079,6 +2133,7 @@ class GenerationHandler:
         if response_state is None:
             response_state = self._create_response_state()
 
+        native_options = get_native_image_options(model_config, len(images or []))
         image_trace: Optional[Dict[str, Any]] = None
         if isinstance(perf_trace, dict):
             image_trace = perf_trace.setdefault("image_generation", {})
@@ -2176,7 +2231,11 @@ class GenerationHandler:
                 progress_callback=_image_progress_callback,
                 google_cookies=getattr(token, "google_cookies", None),
                 preserve_parameters=bool(response_state.get("preserve_parameters")) or bool(model_config.get("upsample")),
+                **({"native_options": native_options} if native_options is not None else {}),
             )
+            if native_options is not None:
+                response_state["generation_transport"] = "native_ui"
+                response_state["native_settings"] = dict(result["native_settings"])
             if image_trace is not None:
                 image_trace["generate_api_ms"] = int(
                     (time.time() - generate_started_at) * 1000
@@ -2510,6 +2569,7 @@ class GenerationHandler:
 
         if response_state is None:
             response_state = self._create_response_state()
+        native_options = get_native_video_options(model_config, len(images or []))
 
         video_trace: Optional[Dict[str, Any]] = None
         if isinstance(perf_trace, dict):
@@ -2828,7 +2888,11 @@ class GenerationHandler:
                     token_id=token.id,
                     token_video_concurrency=token.video_concurrency,
                     google_cookies=getattr(token, "google_cookies", None),
+                    **({"native_options": native_options} if native_options is not None else {}),
                 )
+            if native_options is not None:
+                response_state["generation_transport"] = "native_ui"
+                response_state["native_settings"] = dict(result["native_settings"])
             if video_trace is not None:
                 video_trace["submit_generation_ms"] = int(
                     (time.time() - submit_started_at) * 1000
@@ -2922,7 +2986,7 @@ class GenerationHandler:
             task = Task(
                 task_id=task_id,
                 token_id=token.id,
-                model=model_config["model_key"],
+                model=model_config["model_key"] or response_state.get("requested_model") or model_config["native_model_label"],
                 prompt=prompt,
                 status="processing",
                 scene_id=scene_id,
@@ -3420,10 +3484,16 @@ class GenerationHandler:
                 warnings=warnings,
                 degraded=bool(state.get("degraded", False)),
             )
+            if state.get("generation_transport") == "native_ui":
+                response.update(
+                    generation_transport="native_ui",
+                    native_settings=dict(state.get("native_settings") or {}),
+                )
 
         return json.dumps(response, ensure_ascii=False)
 
-    def _create_error_response(self, error_message: str, status_code: int = 500, *, outcome_unknown: bool = False) -> str:
+    def _create_error_response(self, error_message: str, status_code: int = 500, *, outcome_unknown: bool = False,
+                               native_credit_limits: Optional[Dict[str, int]] = None) -> str:
         """创建错误响应"""
         import json
 
@@ -3439,6 +3509,8 @@ class GenerationHandler:
         }
         if outcome_unknown:
             error["error"]["outcome_unknown"] = True
+        if native_credit_limits is not None:
+            error["error"].update(code="native_credit_limit", **native_credit_limits)
 
         return json.dumps(error, ensure_ascii=False)
 

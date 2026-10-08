@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from src.services.agent_jobs import AgentJobManager, RequestConflict
-from src.services.generation_policy import no_submit_retry
+from src.services.generation_policy import no_submit_retry, get_native_credit_limit
 
 
 class ControlledGenerator:
@@ -98,6 +98,27 @@ class AgentJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["error"]["code"], "captcha_failed")
         self.assertNotIn("fake-secret-for-test-only", json.dumps(result))
 
+    async def test_native_credit_rejection_preserves_only_safe_cost_fields_without_resubmitting(self):
+        class CostRejectedGenerator:
+            calls = 0
+            async def handle_generation(self, **kwargs):
+                self.calls += 1
+                yield json.dumps({"error": {"code": "native_credit_limit", "credits_shown": 12,
+                    "max_credits": 0, "message": "synthetic-private-detail"}})
+        handler = CostRejectedGenerator()
+        self.manager.handler = handler
+        job = await self.manager.submit("sample-video", "ocean", [], "credit-rejected-1")
+        result = await self.wait_for_completion(job["id"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"]["code"], "native_credit_limit")
+        self.assertEqual(result["error"]["credits_shown"], 12)
+        self.assertFalse(result["error"]["submission_started"])
+        self.assertFalse(result["error"]["retryable"])
+        self.assertNotIn("synthetic-private-detail", json.dumps(result))
+        repeated = await self.manager.submit("sample-video", "ocean", [], "credit-rejected-1")
+        self.assertEqual(repeated["id"], job["id"])
+        self.assertEqual(handler.calls, 1)
+
     async def test_plain_chat_success_is_not_mistaken_for_generated_media(self):
         class EmptyGenerator:
             async def handle_generation(self, **kwargs):
@@ -148,6 +169,21 @@ class AgentJobTests(unittest.IsolatedAsyncioTestCase):
         result = await self.wait_for_completion(job["id"])
         self.assertEqual(result["status"], "completed")
         self.assertFalse(no_submit_retry())
+
+    async def test_credit_budget_is_bound_to_one_job_and_cannot_change_on_retry(self):
+        class CreditGenerator:
+            async def handle_generation(inner, **kwargs):
+                self.assertEqual(get_native_credit_limit(), 7)
+                yield {"media": [{"url": "https://example.com/result.png", "type": "image"}],
+                       "generation_transport": "native_ui", "native_settings": {"max_credits": 7, "credits_shown": 0}}
+        self.manager.handler = CreditGenerator()
+        job = await self.manager.submit("sample-image", "an apple", [], "budget-check", max_credits=7)
+        result = await self.wait_for_completion(job["id"])
+        self.assertEqual(result["max_credits"], 7)
+        self.assertEqual(result["native_settings"]["credits_shown"], 0)
+        self.assertEqual(get_native_credit_limit(), 0)
+        with self.assertRaises(RequestConflict):
+            await self.manager.submit("sample-image", "an apple", [], "budget-check", max_credits=8)
 
 
 if __name__ == "__main__":

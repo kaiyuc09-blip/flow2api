@@ -35,14 +35,14 @@ def create_server(settings=None, *, transport=None, resolver=None):
         return await invoke("list_models")
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True))
-    async def generate_image(model: str, prompt: str, request_id: str, image_paths: list[str] | None = None) -> dict:
-        """Submit text-to-image or reference-image editing; may use account credits. Use a model from list_models and an 8-128 character stable request_id. Optional image_paths are absolute local PNG/JPEG/WebP paths, up to 20 MiB each. Returns a task immediately; call get_generation later. Never create a new request_id merely to retry unknown results."""
-        return await invoke("submit", "image", model, prompt, image_paths or [], request_id)
+    async def generate_image(model: str, prompt: str, request_id: str, image_paths: list[str] | None = None, max_credits: int = 0) -> dict:
+        """Submit text-to-image or reference-image editing; may use account credits. Use a model from list_models and an 8-128 character stable request_id. Native browser mode reads the displayed credit cost before submitting; max_credits defaults to zero and may be raised only with explicit user approval. It does not cap third-party captcha/API charges. Optional image_paths are absolute local PNG/JPEG/WebP paths, up to 20 MiB each. Returns a task immediately; call get_generation later. Never create a new request_id merely to retry unknown results."""
+        return await invoke("submit", "image", model, prompt, image_paths or [], request_id, max_credits)
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True))
-    async def submit_video(model: str, prompt: str, request_id: str, image_paths: list[str] | None = None) -> dict:
-        """Submit text-to-video or reference-image video; may use account credits. Select exact model, duration and orientation from list_models. image_paths are absolute local images. Returns a task immediately; query get_generation later. Preserve request_id and do not automatically resubmit on timeout."""
-        return await invoke("submit", "video", model, prompt, image_paths or [], request_id)
+    async def submit_video(model: str, prompt: str, request_id: str, image_paths: list[str] | None = None, max_credits: int = 0) -> dict:
+        """Submit text-to-video or reference-image video; may use account credits. Select exact model, duration and orientation from list_models. A native browser route must verify displayed credits within max_credits (default zero); raise the limit only after explicit user approval. This limit does not cover RPC/captcha charges. image_paths are absolute local images. Returns a task immediately; query get_generation later. Preserve request_id and do not automatically resubmit on timeout."""
+        return await invoke("submit", "video", model, prompt, image_paths or [], request_id, max_credits)
 
     @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True))
     async def get_generation(generation_id: str | None = None, request_id: str | None = None) -> dict:

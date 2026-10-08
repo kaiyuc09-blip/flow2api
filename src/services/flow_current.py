@@ -15,8 +15,11 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from ..core.config import config
 from ..core.logger import debug_logger
 from .browser_cookie_utils import validate_flow_cookie_storage
-from .model_capabilities import allows_native_default_image, get_parameter_preserving_captcha_method
-from .generation_policy import submission_attempts, raise_if_submission_uncertain
+from .model_capabilities import (
+    allows_native_default_image, get_parameter_preserving_captcha_method,
+    validate_native_image_options, NATIVE_IMAGE_ASPECTS, validate_native_video_options, NATIVE_VIDEO_ASPECTS,
+)
+from .generation_policy import submission_attempts, raise_if_submission_uncertain, GenerationOutcomeUnknown, get_native_credit_limit
 
 class CurrentFlowClientMixin:
     FRONTEND_ACCESS_TOKEN = "flow-frontend-cookie"
@@ -357,14 +360,24 @@ class CurrentFlowClientMixin:
         progress_callback: Optional[Callable[[str, int], Awaitable[None]]] = None,
         google_cookies: Optional[str] = None,
         preserve_parameters: bool = False,
+        native_options: Optional[Dict[str, Any]] = None,
     ) -> tuple[dict, str, Dict[str, Any]]:
-        native_default = not preserve_parameters and allows_native_default_image(
+        native_explicit = native_options is not None
+        if native_explicit:
+            if not isinstance(native_options, dict):
+                raise ValueError("Invalid native image options")
+            native_options = dict(native_options)
+            native_options.setdefault("max_credits", get_native_credit_limit())
+            validate_native_image_options(native_options, len(image_inputs or []))
+            if model_name or NATIVE_IMAGE_ASPECTS.get(aspect_ratio) != native_options["aspect_ratio"]:
+                raise ValueError("Native image selection must match its UI model and aspect ratio, without a guessed RPC key")
+        native_default = not native_explicit and not preserve_parameters and allows_native_default_image(
             {"type": "image", "model_name": model_name, "aspect_ratio": aspect_ratio},
             len(image_inputs or []),
         )
-        captcha_override = None if native_default else get_parameter_preserving_captcha_method()
+        captcha_override = None if native_default or native_explicit else get_parameter_preserving_captcha_method()
         await self._frontend_cookie(google_cookies, token_id)
-        max_retries = submission_attempts(self._get_runtime_config().flow_max_retries)
+        max_retries = 1 if native_explicit else submission_attempts(self._get_runtime_config().flow_max_retries)
         trace: Dict[str, Any] = {"max_retries": max_retries, "generation_attempts": []}
         last_error: Optional[Exception] = None
         cookie_storage = await self._resolve_flow_frontend_cookie_storage(
@@ -384,11 +397,11 @@ class CurrentFlowClientMixin:
                 personal_mode = config.captcha_method == "personal"
                 personal_native_compatible = (
                     personal_mode
-                    and native_default
-                    and not image_inputs
-                    and str(model_name or "").upper() == "NARWHAL"
-                    and str(aspect_ratio or "").upper()
-                    == "IMAGE_ASPECT_RATIO_LANDSCAPE"
+                    and (native_explicit or (
+                        native_default and not image_inputs
+                        and str(model_name or "").upper() == "NARWHAL"
+                        and str(aspect_ratio or "").upper() == "IMAGE_ASPECT_RATIO_LANDSCAPE"
+                    ))
                 )
                 if personal_native_compatible:
                     from .browser_captcha_personal import BrowserCaptchaService
@@ -411,6 +424,7 @@ class CurrentFlowClientMixin:
                         timeout=max(
                             self._get_runtime_config().flow_image_request_timeout, 120
                         ),
+                        **({"native_options": native_options} if native_explicit else {}),
                     )
                     if not native_result:
                         raise RuntimeError("Personal native image generation failed")
@@ -419,12 +433,15 @@ class CurrentFlowClientMixin:
                     browser_id = f"personal:{session_id}" if session_id else None
                     response_text = str(native_result.get("responseText") or "")
                     frames = self._parse_batchexecute_frames(response_text)
-                    media_ids = self._extract_stream_chat_media_ids(frames)
-                    if not media_ids:
-                        raise RuntimeError(
-                            "Personal native StreamChat returned no generated media "
-                            f"(rawLength={native_result.get('rawLength')})"
-                        )
+                    native_settings = native_result.get("native_settings")
+                    if native_explicit:
+                        if not isinstance(native_settings, dict) or native_settings.get("verified_before_submit") is not True or any(
+                            native_settings.get(key) != native_options[key]
+                            for key in ("model_label", "aspect_ratio", "image_count", "max_credits")
+                        ):
+                            raise RuntimeError("Native UI model, ratio and count were not confirmed before submission")
+                        if type(native_settings.get("credits_shown")) is not int or not 0 <= native_settings["credits_shown"] <= native_options["max_credits"]:
+                            raise RuntimeError("Native UI credit estimate was not confirmed within the approved budget")
 
                     fingerprint = native_result.get("fingerprint")
                     if isinstance(fingerprint, dict) and fingerprint:
@@ -432,28 +449,34 @@ class CurrentFlowClientMixin:
 
                     if progress_callback:
                         await progress_callback("processing_image", 72)
-                    media = []
-                    for media_id in media_ids[:2]:
-                        media_entry = await self.get_media(
-                            at,
-                            media_id,
-                            google_cookies=google_cookies,
-                            token_id=token_id,
-                            project_id=project_id,
-                        )
-                        if str(
-                            (media_entry.get("image") or {})
-                            .get("generatedImage", {})
-                            .get("fifeUrl")
-                            or ""
-                        ):
-                            media.append(media_entry)
+                    frontend_rpc = native_result.get("frontendRpc") or (None if native_explicit else "StreamChat")
+                    if frontend_rpc == "ogiZ0b":
+                        payload = self._extract_batchexecute_payload(frames, "ogiZ0b")
+                        media = self._normalize_frontend_image_generation_response(payload)["media"]
+                    elif frontend_rpc == "StreamChat":
+                        media_ids = self._extract_stream_chat_media_ids(frames)
+                        if native_explicit and len(media_ids) != 1:
+                            raise RuntimeError("Native image response did not contain exactly one generated image")
+                        media = []
+                        for media_id in media_ids[:2]:
+                            media_entry = await self.get_media(
+                                at, media_id, google_cookies=google_cookies,
+                                token_id=token_id, project_id=project_id,
+                            )
+                            if str((media_entry.get("image") or {}).get("generatedImage", {}).get("fifeUrl") or ""):
+                                media.append(media_entry)
+                    else:
+                        raise RuntimeError("Native image generation used an unrecognized response protocol")
                     if not media:
                         raise RuntimeError(
                             "Personal native StreamChat media could not be resolved"
                         )
 
-                    result = {"media": media, "frontendRpc": "StreamChat"}
+                    if native_explicit and len(media) != 1:
+                        raise RuntimeError("Native image response did not contain exactly one generated image")
+                    result = {"media": media, "frontendRpc": frontend_rpc}
+                    if native_explicit:
+                        result.update(native_settings=dict(native_settings), generation_transport="native_ui")
                     attempt["success"] = True
                     attempt["duration_ms"] = int((time.time() - started_at) * 1000)
                     trace["generation_attempts"].append(attempt)
@@ -464,7 +487,7 @@ class CurrentFlowClientMixin:
                 # - personal 默认纯文生横图已在上面的原子浏览器流程处理；
                 #   其他 personal 参数组合使用第三方 token + ogiZ0b，避免丢失参数。
                 # - browser 仅在默认横图且无参考图时沿用网页默认模型；其身份未验证。
-                # - 显式参数及 Agent 请求始终走参数完整的 RPC，不能静默丢弃选择。
+                # - 原生模型的精确 UI 选择已在上方处理；其他显式参数走完整 RPC。
                 # - 第三方打码 (yescaptcha 等)：token 只被 batchexecute 通道接受，
                 #   走原 ogiZ0b 链路，action 保持上游既有的 IMAGE_GENERATION。
                 stream_transport = config.captcha_method == "browser" and native_default
@@ -572,6 +595,12 @@ class CurrentFlowClientMixin:
                 attempt["error"] = str(error)[:240]
                 attempt["duration_ms"] = int((time.time() - started_at) * 1000)
                 trace["generation_attempts"].append(attempt)
+                if native_explicit and getattr(error, "submission_started", None) is False:
+                    submitted = False
+                if native_explicit and submitted and not getattr(error, "outcome_unknown", False):
+                    raise GenerationOutcomeUnknown(
+                        "Native UI submission outcome is unknown; no automatic resubmission was attempted"
+                    ) from error
                 raise_if_submission_uncertain(error, submitted=submitted)
                 retry_handler = getattr(
                     self, "_handle_retryable_generation_error", None
@@ -735,6 +764,63 @@ class CurrentFlowClientMixin:
                 await self._notify_browser_captcha_request_finished(browser_id)
         raise last_error or RuntimeError("Flow frontend video generation failed")
 
+    async def _current_generate_native_video(
+        self, *, project_id: str, prompt: str, model_key: Optional[str], aspect_ratio: str,
+        token_id: Optional[int], google_cookies: Optional[str], native_options: Dict[str, Any],
+    ) -> dict:
+        if not isinstance(native_options, dict):
+            raise ValueError("Invalid native video options")
+        native_options = dict(native_options)
+        native_options.setdefault("max_credits", get_native_credit_limit())
+        validate_native_video_options(native_options)
+        if model_key or NATIVE_VIDEO_ASPECTS.get(aspect_ratio) != native_options["aspect_ratio"]:
+            raise ValueError("Native video selection must match its UI model and aspect ratio, without a guessed RPC key")
+        await self._frontend_cookie(google_cookies, token_id)
+        from .browser_captcha_personal import BrowserCaptchaService
+
+        personal_service = getattr(self, "_personal_browser_service", None)
+        if personal_service is None:
+            personal_service = await BrowserCaptchaService.get_instance(getattr(self, "db", None))
+        browser_id = None
+        try:
+            native_result = await personal_service.generate_native_video(
+                project_id=project_id, prompt=prompt, token_id=token_id,
+                timeout=max(self._get_video_submit_timeout(), 120), native_options=native_options,
+            )
+            if not isinstance(native_result, dict):
+                raise RuntimeError("Personal native video generation returned no submission result")
+            native_settings = native_result.get("native_settings")
+            if not isinstance(native_settings, dict) or native_settings.get("verified_before_submit") is not True or any(
+                native_settings.get(key) != native_options[key]
+                for key in ("model_label", "aspect_ratio", "resolution", "duration_seconds", "video_count", "max_credits")
+            ):
+                raise RuntimeError("Native video UI settings were not confirmed before submission")
+            if type(native_settings.get("credits_shown")) is not int or not 0 <= native_settings["credits_shown"] <= native_options["max_credits"]:
+                raise RuntimeError("Native video UI credit estimate was not confirmed within the approved budget")
+            session_id = str(native_result.get("session_id") or "").strip()
+            browser_id = f"personal:{session_id}" if session_id else None
+            fingerprint = native_result.get("fingerprint")
+            if isinstance(fingerprint, dict) and fingerprint:
+                self._set_request_fingerprint(fingerprint)
+            frontend_rpc = native_result.get("frontendRpc")
+            if frontend_rpc not in ("YhhmEf", "MZZa6b"):
+                raise RuntimeError("Native text video result used an unrecognized submission protocol")
+            frames = self._parse_batchexecute_frames(str(native_result.get("responseText") or ""))
+            payload = self._extract_batchexecute_payload(frames, frontend_rpc)
+            result = self._normalize_frontend_video_submission(
+                payload, project_id=project_id, aspect_ratio=aspect_ratio, model_key=None, rpc_id=frontend_rpc,
+            )
+            if not result.get("direct_media") and len(result.get("operations") or []) != 1:
+                raise RuntimeError("Native video result did not contain exactly one generation operation")
+            result.update(native_settings=native_settings, generation_transport="native_ui")
+            return result
+        except Exception as error:
+            if getattr(error, "submission_started", None) is False or getattr(error, "outcome_unknown", False):
+                raise
+            raise GenerationOutcomeUnknown("原生视频生成已尝试提交，但结果无法确认；请核对 Flow 原任务，不要重新提交") from error
+        finally:
+            await self._notify_browser_captcha_request_finished(browser_id)
+
     async def generate_video_text(
         self,
         at: str,
@@ -747,7 +833,13 @@ class CurrentFlowClientMixin:
         token_id: Optional[int] = None,
         token_video_concurrency: Optional[int] = None,
         google_cookies: Optional[str] = None,
+        native_options: Optional[Dict[str, Any]] = None,
     ) -> dict:
+        if native_options is not None:
+            return await self._current_generate_native_video(
+                project_id=project_id, prompt=prompt, model_key=model_key, aspect_ratio=aspect_ratio,
+                token_id=token_id, google_cookies=google_cookies, native_options=native_options,
+            )
         return await self._current_generate_video(
             project_id=project_id,
             prompt=prompt,

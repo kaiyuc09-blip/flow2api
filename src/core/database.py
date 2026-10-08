@@ -504,6 +504,7 @@ class Database:
             # Check and add missing columns to tokens table
             if await self._table_exists(db, "tokens"):
                 columns_to_add = [
+                    ("account_source", "TEXT NOT NULL DEFAULT 'manual'"),
                     ("at", "TEXT"),  # Access Token
                     ("at_expires", "TIMESTAMP"),  # AT expiration time
                     ("credits", "INTEGER DEFAULT 0"),  # Balance
@@ -738,6 +739,7 @@ class Database:
                     email TEXT NOT NULL,
                     name TEXT,
                     remark TEXT,
+                    account_source TEXT NOT NULL DEFAULT 'manual',
                     is_active BOOLEAN DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_used_at TIMESTAMP,
@@ -1116,8 +1118,8 @@ class Database:
                                    captcha_proxy_url, extension_route_key,
                                    protocol_mode, google_cookies, login_account, login_password,
                                    proxy_url, auto_refresh_enabled, refresh_interval_minutes,
-                                   last_st_refresh_at, last_st_refresh_result)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   last_st_refresh_at, last_st_refresh_result, account_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     token.st,
@@ -1146,6 +1148,7 @@ class Database:
                     token.refresh_interval_minutes,
                     token.last_st_refresh_at,
                     token.last_st_refresh_result,
+                    token.account_source,
                 ),
             )
             await db.commit()

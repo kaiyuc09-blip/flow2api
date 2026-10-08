@@ -3,6 +3,21 @@ from contextvars import ContextVar, Token
 
 
 _no_submit_retry: ContextVar[bool] = ContextVar("flow_no_submit_retry", default=False)
+_native_credit_limit: ContextVar[int] = ContextVar("flow_native_credit_limit", default=0)
+
+
+def get_native_credit_limit() -> int:
+    return _native_credit_limit.get()
+
+
+def set_native_credit_limit(limit: int) -> Token:
+    if type(limit) is not int or not 0 <= limit <= 1000:
+        raise ValueError("Native credit limit must be an integer from 0 to 1000")
+    return _native_credit_limit.set(limit)
+
+
+def reset_native_credit_limit(token: Token) -> None:
+    _native_credit_limit.reset(token)
 
 
 def set_no_submit_retry(enabled: bool = True) -> Token:

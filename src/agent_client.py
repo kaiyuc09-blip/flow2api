@@ -284,7 +284,9 @@ class AgentClient:
                     raise AgentClientError("download_failed", "The media download was interrupted; no automatic restart was attempted.") from None
         raise AgentClientError("download_failed", "Too many media redirects.")
 
-    async def submit(self, kind: str, model: str, prompt: str, image_paths: list[str], request_id: str):
+    async def submit(self, kind: str, model: str, prompt: str, image_paths: list[str], request_id: str, max_credits: int = 0):
+        if type(max_credits) is not int or not 0 <= max_credits <= 1000:
+            raise AgentClientError("invalid_credit_limit", "max_credits must be an explicitly approved integer from 0 to 1000; default 0 permits only a native UI showing zero credits.")
         if not prompt.strip() or len(prompt) > 16_000:
             raise AgentClientError("invalid_prompt", "Provide a nonempty prompt of at most 16000 characters.")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{7,127}", request_id):
@@ -319,7 +321,7 @@ class AgentClient:
                 raise AgentClientError("references_too_large", "Reference images exceed the 28 MiB total encoded request limit.")
             images.append(encoded)
         try:
-            return await self._api("POST", "/v1/agent/generations", json={"model": model, "prompt": prompt, "images": images, "request_id": request_id})
+            return await self._api("POST", "/v1/agent/generations", json={"model": model, "prompt": prompt, "images": images, "request_id": request_id, "max_credits": max_credits})
         except AgentClientError as error:
             if error.code != "submission_unknown":
                 raise

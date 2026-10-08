@@ -34,6 +34,12 @@ from curl_cffi.requests import AsyncSession
 
 from ..core.logger import debug_logger
 from ..core.config import config
+from .native_flow_ui import (
+    NativeFlowUIError, NodriverFlowSettingsUI,
+    configure_native_image_settings, validate_native_image_options,
+    configure_native_video_settings, validate_native_video_options,
+    verify_native_generation_settings,
+)
 from .browser_cookie_utils import (
     build_browser_cookie_targets,
     build_cookie_signature,
@@ -431,11 +437,7 @@ def _run_pip_install(package: str, use_mirror: bool = False) -> bool:
 
 
 def _ensure_nodriver_installed() -> bool:
-    """确保 nodriver 已安装
-    
-    Returns:
-        是否安装成功/已安装
-    """
+    """Check the project dependency without installing software on import."""
     try:
         import nodriver
 
@@ -444,23 +446,7 @@ def _ensure_nodriver_installed() -> bool:
     except ImportError:
         pass
     
-    debug_logger.log_info("[BrowserCaptcha] nodriver 未安装，开始自动安装...")
-    print("[BrowserCaptcha] nodriver 未安装，开始自动安装...")
-    
-    # 先尝试官方源
-    if _run_pip_install("nodriver", use_mirror=False):
-        return True
-    
-    # 官方源失败，尝试国内镜像
-    debug_logger.log_info("[BrowserCaptcha] 官方源安装失败，尝试国内镜像...")
-    print("[BrowserCaptcha] 官方源安装失败，尝试国内镜像...")
-    if _run_pip_install("nodriver", use_mirror=True):
-        return True
-    
-    debug_logger.log_error(
-        "[BrowserCaptcha] ❌ nodriver 自动安装失败，请手动安装: pip install nodriver"
-    )
-    print("[BrowserCaptcha] ❌ nodriver 自动安装失败，请手动安装: pip install nodriver")
+    debug_logger.log_error("[BrowserCaptcha] 缺少 nodriver，请先准备项目依赖；不会自动安装")
     return False
 
 
@@ -1830,6 +1816,11 @@ class BrowserCaptchaService:
     def _create_fresh_runtime_profile_dir(
         self, *, prefix: str = "fresh_browser_profile_"
     ) -> str:
+        if os.environ.get("PERSONAL_BROWSER_USER_DATA_DIR", "").strip():
+            from .personal_account import dedicated_profile_path
+            self.user_data_dir = str(dedicated_profile_path())
+            self._runtime_ephemeral_user_data_dir = None
+            return self.user_data_dir
         PERSONAL_RUNTIME_TMP_DIR.mkdir(parents=True, exist_ok=True)
         fresh_profile_dir = tempfile.mkdtemp(
             prefix=prefix,
@@ -1843,15 +1834,14 @@ class BrowserCaptchaService:
 
     def _resolve_user_data_dir(self, headless: Optional[bool] = None) -> Optional[str]:
         _ = self.headless if headless is None else bool(headless)
+        if os.environ.get("PERSONAL_BROWSER_USER_DATA_DIR", "").strip():
+            from .personal_account import dedicated_profile_path
+            return str(dedicated_profile_path())
         existing_runtime_profile = str(
             getattr(self, "_runtime_ephemeral_user_data_dir", "") or ""
         ).strip()
         if existing_runtime_profile:
             return os.path.normpath(existing_runtime_profile)
-
-        profile_override = os.environ.get("PERSONAL_BROWSER_USER_DATA_DIR", "").strip()
-        if profile_override:
-            return os.path.normpath(profile_override)
 
         return self._create_fresh_runtime_profile_dir(prefix="browser_profile_")
 
@@ -1878,6 +1868,8 @@ class BrowserCaptchaService:
         )
 
     def _collect_runtime_profile_cleanup_targets(self) -> list[Path]:
+        if os.environ.get("PERSONAL_BROWSER_USER_DATA_DIR", "").strip():
+            return []
         targets: list[Path] = []
         seen_targets: set[str] = set()
 
@@ -1905,6 +1897,10 @@ class BrowserCaptchaService:
         return targets
 
     async def _purge_runtime_profile_dirs(self, reason: str) -> None:
+        if os.environ.get("PERSONAL_BROWSER_USER_DATA_DIR", "").strip():
+            self.user_data_dir = self._resolve_user_data_dir()
+            self._runtime_ephemeral_user_data_dir = None
+            return
         current_user_data_dir = str(self.user_data_dir or "").strip()
         cleanup_targets = self._collect_runtime_profile_cleanup_targets()
         if current_user_data_dir and not self._is_runtime_managed_profile_dir(
@@ -1945,6 +1941,10 @@ class BrowserCaptchaService:
     async def _cleanup_runtime_profile_dirs_after_shutdown(
         self, *, reason: str
     ) -> bool:
+        if os.environ.get("PERSONAL_BROWSER_USER_DATA_DIR", "").strip():
+            self.user_data_dir = self._resolve_user_data_dir()
+            self._runtime_ephemeral_user_data_dir = None
+            return False
         current_user_data_dir = str(self.user_data_dir or "").strip()
         cleanup_targets = self._collect_runtime_profile_cleanup_targets()
         if current_user_data_dir and not self._is_runtime_managed_profile_dir(
@@ -10399,6 +10399,7 @@ class BrowserCaptchaService:
 
                             if (
                                 not tried_fresh_profile_retry
+                                and not os.environ.get("PERSONAL_BROWSER_USER_DATA_DIR", "").strip()
                                 and self._is_retryable_browser_launch_error(start_error)
                             ):
                                 tried_fresh_profile_retry = True
@@ -11761,14 +11762,39 @@ class BrowserCaptchaService:
             await asyncio.sleep(0.5)
         return False
 
-    async def _submit_native_prompt(self, tab, prompt: str, *, label: str) -> None:
+    async def _prepare_native_prompt(self, tab, prompt: str, *, label: str) -> None:
+        """Insert the whole prompt once; never send Enter during preparation."""
+        from nodriver import cdp
+        editor = await tab.select(".ProseMirror", timeout=10)
+        if editor is None:
+            raise NativeFlowUIError("找不到网页提示词编辑器；本次请求未提交")
+        await editor.click()
+        await tab.send(cdp.input_.insert_text(prompt))
+        actual = await self._tab_evaluate(tab,
+            "String(document.querySelector('.ProseMirror')?.innerText ?? '')",
+            label=f"{label}:prompt_readback", timeout_seconds=5.0, return_by_value=True)
+        normalize = lambda value: str(value).replace("\r\n", "\n").replace("\u00a0", " ")
+        if normalize(actual) != normalize(prompt):
+            raise NativeFlowUIError("网页提示词读回不一致；本次请求未提交")
+
+    async def _assert_native_page_unblocked(self, tab, *, label: str) -> None:
+        blocked = await self._tab_evaluate(tab, """(() => {
+            return Array.from(document.querySelectorAll('[role="dialog"],[role="alertdialog"],.cdk-overlay-pane'))
+                .some(el => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; });
+        })()""", label=f"{label}:blocking_overlay", timeout_seconds=5.0, return_by_value=True)
+        if blocked is not False:
+            raise NativeFlowUIError("网页存在需要本人处理的弹窗；本次请求未提交")
+
+    async def _submit_native_prompt(self, tab, prompt: str, *, label: str, prepared: bool = False) -> None:
         from nodriver import cdp
 
         editor = await tab.select(".ProseMirror", timeout=10)
         if editor is None:
             raise RuntimeError("Flow prompt editor is unavailable")
         await editor.click()
-        await editor.send_keys(prompt)
+        if not prepared:
+            await editor.send_keys(prompt)
 
         await tab.send(
             cdp.input_.dispatch_key_event(
@@ -11981,12 +12007,24 @@ class BrowserCaptchaService:
         )
 
     async def _install_native_generation_observer(self, tab) -> bool:
-        """Let Flow's native StreamChat request continue and capture its response."""
+        """Observe normal UI generation without changing the page's agent mode."""
         script = """(() => {
             const stateKey = '__flow2apiNativeGeneration';
-            window[stateKey] = {done:false,status:0,requestBody:'',responseText:'',error:''};
+            window[stateKey] = {done:false,status:0,requestBody:'',responseText:'',error:'',frontendRpc:''};
             if (window.__flow2apiNativeGenerationPatched) return true;
             window.__flow2apiNativeGenerationPatched = true;
+            const generationRpc = url => {
+                if (String(url || '').includes('StreamChat')) return 'StreamChat';
+                try {
+                    const parsed = new URL(String(url || ''), location.href);
+                    const ids = (parsed.searchParams.get('rpcids') || '').split(',');
+                    if (parsed.pathname.endsWith('/data/batchexecute')) {
+                        const generationIds = ['ogiZ0b', 'YhhmEf', 'MZZa6b', 'nprQif', 'eb1hJf', 'fZytfe', 'p0UkFb'];
+                        return ids.find(id => generationIds.includes(id)) || '';
+                    }
+                } catch (_) {}
+                return '';
+            };
             const originalOpen = XMLHttpRequest.prototype.open;
             const originalSend = XMLHttpRequest.prototype.send;
             XMLHttpRequest.prototype.open = function(method, url, ...rest) {
@@ -11995,9 +12033,11 @@ class BrowserCaptchaService:
             };
             XMLHttpRequest.prototype.send = function(body) {
                 const url = this.__flow2apiNativeGenerationUrl || '';
-                if (!url.includes('StreamChat')) return originalSend.call(this, body);
+                const rpc = generationRpc(url);
+                if (!rpc) return originalSend.call(this, body);
                 const request = this;
                 const state = window[stateKey];
+                state.frontendRpc = rpc;
                 state.requestBody = String(body || '');
                 request.addEventListener('readystatechange', () => {
                     if (request.readyState !== 4) return;
@@ -12023,10 +12063,12 @@ class BrowserCaptchaService:
                     let url = '';
                     if (typeof input === 'string') url = input;
                     else if (input && typeof input.url === 'string') url = input.url;
-                    if (!String(url || '').includes('StreamChat')) {
+                    const rpc = generationRpc(url);
+                    if (!rpc) {
                         return originalFetch.call(window, input, init);
                     }
                     const state = window[stateKey];
+                    state.frontendRpc = rpc;
                     state.requestBody = String((init && init.body) || '');
                     try {
                         const response = await originalFetch.call(window, input, init);
@@ -12062,7 +12104,9 @@ class BrowserCaptchaService:
             return False
 
     async def _generate_native_image_on_tab(
-        self, resident_info, project_id: str, prompt: str, timeout: int
+        self, resident_info, project_id: str, prompt: str, timeout: int,
+        *, native_options: Optional[Dict[str, Any]] = None,
+        media_type: str = "image",
     ) -> Optional[Dict[str, Any]]:
         normalized_project_id = str(project_id or "").strip()
         if not normalized_project_id or not resident_info or not resident_info.tab:
@@ -12070,6 +12114,7 @@ class BrowserCaptchaService:
         tab = resident_info.tab
         label = f"native_generate:{resident_info.slot_id}"
         submitted = False
+        native_settings = None
         try:
             await self._tab_get(
                 tab, PERSONAL_COOKIE_PREBIND_URL,
@@ -12080,15 +12125,37 @@ class BrowserCaptchaService:
                 label=f"{label}:project", timeout_seconds=self._navigation_timeout_seconds,
             )
             await self._wait_for_document_ready(tab, retries=30, interval_seconds=0.5)
-            await self._dismiss_native_page_overlays(tab, label=label)
+            if native_options is None:
+                await self._dismiss_native_page_overlays(tab, label=label)
+            else:
+                await self._assert_native_page_unblocked(tab, label=label)
             if not await self._wait_for_recaptcha(tab):
                 raise RuntimeError("native generation page recaptcha is not ready")
             if not await self._wait_for_native_prompt_editor(tab, label=label):
                 raise RuntimeError("native generation prompt editor is not ready")
+            if native_options is not None:
+                draft = await self._tab_evaluate(tab, """(() => {
+                    const editor = document.querySelector('.ProseMirror');
+                    return JSON.stringify({available: !!editor,
+                        empty: !!editor && !String(editor.textContent || '').trim(),
+                        hasMedia: !!editor && !!editor.querySelector('img,video,[data-type="image"],[data-type="file"],[data-type="mention"]')});
+                })()""", label=f"{label}:draft", timeout_seconds=5.0, return_by_value=True)
+                draft = json.loads(draft) if isinstance(draft, str) else draft
+                if not isinstance(draft, dict) or not draft.get("available") or not draft.get("empty") or draft.get("hasMedia"):
+                    raise NativeFlowUIError("网页编辑器已有草稿或素材；为避免混入内容，本次请求未提交")
+                configure_settings = configure_native_video_settings if media_type == "video" else configure_native_image_settings
+                native_settings = await configure_settings(
+                    NodriverFlowSettingsUI(tab, self._tab_evaluate, label=label), native_options
+                )
+                await self._prepare_native_prompt(tab, prompt, label=label)
+                native_settings = await verify_native_generation_settings(
+                    NodriverFlowSettingsUI(tab, self._tab_evaluate, label=label), native_options, media_type=media_type
+                )
             if not await self._install_native_generation_observer(tab):
                 raise RuntimeError("native generation observer is unavailable")
-            await self._submit_native_prompt(tab, prompt, label=label)
+            # Dispatch may reach the page even if the browser command response is lost.
             submitted = True
+            await self._submit_native_prompt(tab, prompt, label=label, prepared=native_options is not None)
 
             deadline = time.monotonic() + max(30.0, float(timeout))
             state_json = "{}"
@@ -12110,7 +12177,8 @@ class BrowserCaptchaService:
                     state = {}
                 if state.get("done"):
                     break
-                await self._dismiss_native_page_overlays(tab, label=f"{label}:waiting")
+                if native_options is None:
+                    await self._dismiss_native_page_overlays(tab, label=f"{label}:waiting")
                 await asyncio.sleep(0.5)
             try:
                 state = json.loads(state_json)
@@ -12149,13 +12217,21 @@ class BrowserCaptchaService:
                 "session_id": (harvest or {}).get("session_id"),
                 "slot_id": resident_info.slot_id,
                 "fingerprint": self.get_last_fingerprint(),
+                "frontendRpc": str(state.get("frontendRpc") or "StreamChat"),
+                **({"native_settings": native_settings} if native_settings is not None else {}),
             }
         except NativeGenerationOutcomeUnknownError:
+            raise
+        except NativeFlowUIError:
             raise
         except Exception as e:
             if submitted:
                 raise NativeGenerationOutcomeUnknownError(
                     "native generation outcome is unknown"
+                ) from e
+            if native_options is not None:
+                raise NativeFlowUIError(
+                    "原生生成页面或设置未准备完成；本次请求未提交"
                 ) from e
             debug_logger.log_warning(
                 f"[BrowserCaptcha] {label} 原生生成失败: "
@@ -12164,8 +12240,28 @@ class BrowserCaptchaService:
             return None
 
     async def generate_native_image(
-        self, *, project_id: str, prompt: str, token_id: Optional[int], timeout: int
+        self, *, project_id: str, prompt: str, token_id: Optional[int], timeout: int,
+        native_options: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
+        return await self._generate_native_media(project_id=project_id, prompt=prompt,
+            token_id=token_id, timeout=timeout, native_options=native_options, media_type="image")
+
+    async def generate_native_video(
+        self, *, project_id: str, prompt: str, token_id: Optional[int], timeout: int,
+        native_options: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        return await self._generate_native_media(project_id=project_id, prompt=prompt,
+            token_id=token_id, timeout=timeout, native_options=native_options, media_type="video")
+
+    async def _generate_native_media(
+        self, *, project_id: str, prompt: str, token_id: Optional[int], timeout: int,
+        native_options: Optional[Dict[str, Any]], media_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        if media_type == "video":
+            native_options = validate_native_video_options(native_options)
+        if native_options is not None:
+            if media_type == "image":
+                native_options = validate_native_image_options(native_options)
         self._mark_runtime_active()
         await self.initialize()
         slot_id, resident_info = await self._ensure_resident_tab(
@@ -12176,18 +12272,34 @@ class BrowserCaptchaService:
         started_at = time.time()
         try:
             if not slot_id or not resident_info:
+                if native_options is not None:
+                    raise NativeFlowUIError("原生账号标签页不可用；本次请求未提交")
                 return None
+            if native_options is not None:
+                try:
+                    cookie_signature = self._normalize_cookie_signature(await self._load_token_cookie(token_id)) if token_id else None
+                    if not cookie_signature or not await self._ensure_resident_token_binding(
+                        resident_info, token_id, label=f"native_generate:{slot_id}"
+                    ):
+                        raise NativeFlowUIError("原生账号绑定未确认；本次请求未提交")
+                except NativeFlowUIError:
+                    raise
+                except Exception as error:
+                    raise NativeFlowUIError("原生账号绑定未确认；本次请求未提交") from error
             used_native_harvest = False
             async with resident_info.solve_lock:
+                if native_options is not None:
+                    desired_signature = self._normalize_cookie_signature(await self._load_token_cookie(token_id))
+                    if not desired_signature or resident_info.token_id != token_id or resident_info.cookie_signature != desired_signature:
+                        raise NativeFlowUIError("原生账号绑定已变化；本次请求未提交")
                 await self._consume_resident_slot_reservation(
                     slot_id, resident_info=resident_info
                 )
                 reservation_consumed = True
-                solve_mode = self._personal_solve_mode(
-                    "CHAT_GENERATION", resident_info
-                )
+                solve_mode = ("harvest" if native_options is not None else
+                              self._personal_solve_mode("CHAT_GENERATION", resident_info))
                 auto_mode = (
-                    str(
+                    native_options is None and str(
                         getattr(config, "personal_solve_strategy", "auto") or "auto"
                     )
                     == "auto"
@@ -12244,7 +12356,9 @@ class BrowserCaptchaService:
                     used_native_harvest = True
                     result = await self._run_with_timeout(
                         self._generate_native_image_on_tab(
-                            resident_info, project_id, prompt, timeout
+                            resident_info, project_id, prompt, timeout,
+                            **({"native_options": native_options} if native_options is not None else {}),
+                            **({"media_type": "video"} if media_type == "video" else {}),
                         ),
                         timeout_seconds=max(40.0, float(timeout) + 30.0),
                         label=f"native_generate_timeout:{project_id}",
@@ -16331,7 +16445,27 @@ class _PersonalBrowserPoolService:
         prompt: str,
         token_id: Optional[int],
         timeout: int,
+        native_options: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
+        return await self._generate_native_media(project_id=project_id, prompt=prompt,
+            token_id=token_id, timeout=timeout, native_options=native_options, media_type="image")
+
+    async def generate_native_video(
+        self, *, project_id: str, prompt: str, token_id: Optional[int], timeout: int,
+        native_options: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        return await self._generate_native_media(project_id=project_id, prompt=prompt,
+            token_id=token_id, timeout=timeout, native_options=native_options, media_type="video")
+
+    async def _generate_native_media(
+        self, *, project_id: str, prompt: str, token_id: Optional[int], timeout: int,
+        native_options: Optional[Dict[str, Any]], media_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        if media_type == "video":
+            native_options = validate_native_video_options(native_options)
+        if native_options is not None:
+            if media_type == "image":
+                native_options = validate_native_image_options(native_options)
         await self._ensure_workers()
         worker_index = None
         try:
@@ -16340,11 +16474,13 @@ class _PersonalBrowserPoolService:
                 token_id=token_id,
                 ensure_workers=False,
             )
-            result = await worker.generate_native_image(
+            generate = worker.generate_native_video if media_type == "video" else worker.generate_native_image
+            result = await generate(
                 project_id=project_id,
                 prompt=prompt,
                 token_id=token_id,
                 timeout=timeout,
+                **({"native_options": native_options} if native_options is not None else {}),
             )
             if isinstance(result, dict):
                 self._remember_native_session_worker(

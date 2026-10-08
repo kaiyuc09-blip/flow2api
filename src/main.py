@@ -121,6 +121,12 @@ async def lifespan(app: FastAPI):
 
     # 启动时统一把数据库配置同步到内存，避免 personal/brower 相关运行时配置遗漏。
     await db.reload_config_to_memory()
+    native_credentials = getattr(app.state, "native_launch_credentials", None)
+    if native_credentials is not None:
+        from .services.native_runtime import validate_native_runtime_config
+        validate_native_runtime_config(config, native_credentials)
+    if os.environ.get("FLOW2API_DB_PATH"):
+        Path(db.db_path).chmod(0o600)
     await agent_jobs.start()
     generation_handler.file_cache.set_timeout(config.cache_timeout)
     cache_cleanup_enabled = await generation_handler.file_cache.refresh_cleanup_task()
@@ -188,6 +194,7 @@ async def lifespan(app: FastAPI):
         print("Browser captcha service initialized (headed mode)")
 
     # Initialize concurrency manager
+    app.state.personal_browser_service = browser_service if captcha_config.captcha_method == "personal" else None
     await concurrency_manager.initialize(tokens)
 
     if config.captcha_method == "remote_browser":
@@ -235,6 +242,7 @@ async def lifespan(app: FastAPI):
     # Shutdown
     print("Flow2API Shutting down...")
     await agent_jobs.close()
+    app.state.personal_browser_service = None
     # Stop file cache cleanup task
     await generation_handler.file_cache.stop_cleanup_task()
     # Stop auto-unban task
@@ -254,7 +262,7 @@ async def lifespan(app: FastAPI):
 
 
 # Initialize components
-db = Database()
+db = Database(db_path=os.environ.get("FLOW2API_DB_PATH") or None)
 proxy_manager = ProxyManager(db)
 flow_client = FlowClient(proxy_manager, db)
 token_manager = TokenManager(db, flow_client)
@@ -298,8 +306,7 @@ app.include_router(admin.router)
 app.include_router(agent.router)
 
 # Static files - serve tmp directory for cached files
-tmp_dir = Path(__file__).parent.parent / "tmp"
-tmp_dir.mkdir(exist_ok=True)
+tmp_dir = generation_handler.file_cache.cache_dir
 app.mount("/tmp", StaticFiles(directory=str(tmp_dir)), name="tmp")
 
 # HTML routes for frontend

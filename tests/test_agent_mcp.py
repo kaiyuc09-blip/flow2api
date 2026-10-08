@@ -151,6 +151,21 @@ class AgentClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("video-1", str(result))
         self.assertNotIn("offline-test-only", str(result))
 
+    async def test_credit_limit_reaches_service_and_invalid_limit_never_submits(self):
+        submitted = []
+        async def service(request):
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": "fixture-video", "type": "video", "available": True}]})
+            submitted.append(json.loads(request.content))
+            return httpx.Response(202, json={"id": "video-1", "status": "queued", "media": []})
+        async with AgentClient(self.settings, transport=httpx.MockTransport(service)) as client:
+            for limit in (True, -1, 1001, "12", 1.5):
+                with self.subTest(limit=limit), self.assertRaises(AgentClientError):
+                    await client.submit("video", "fixture-video", "ocean", [], "limit-1-test", max_credits=limit)
+            await client.submit("video", "fixture-video", "ocean", [], "limit-1-test", max_credits=12)
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(submitted[0]["max_credits"], 12)
+
     async def test_stdio_protocol_can_initialize_list_and_call_offline_service(self):
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
@@ -222,19 +237,22 @@ class AgentClientTests(unittest.IsolatedAsyncioTestCase):
                     definitions = {tool.name: tool for tool in listed.tools}
                     self.assertEqual(set(definitions), {"list_models", "generate_image", "submit_video", "get_generation"})
                     self.assertIn("request_id", definitions["generate_image"].inputSchema["required"])
+                    self.assertEqual(definitions["generate_image"].inputSchema["properties"]["max_credits"]["default"], 0)
+                    self.assertEqual(definitions["submit_video"].inputSchema["properties"]["max_credits"]["default"], 0)
                     self.assertIn("generation_id", definitions["get_generation"].inputSchema["properties"])
                     self.assertIn("request_id", definitions["get_generation"].inputSchema["properties"])
                     self.assertFalse(called.isError)
                     self.assertIn("offline-image", str(called))
                     self.assertNotIn("offline-test-only", str(called))
                     for kind, tool, content in [("image", "generate_image", png), ("video", "submit_video", mp4)]:
-                        started = await session.call_tool(tool, {"model": "offline-" + kind, "prompt": "offline media test", "request_id": "stdio-" + kind + "-1", "image_paths": [str(reference)] if kind == "image" else []})
+                        started = await session.call_tool(tool, {"model": "offline-" + kind, "prompt": "offline media test", "request_id": "stdio-" + kind + "-1", "image_paths": [str(reference)] if kind == "image" else [], "max_credits": 0 if kind == "image" else 12})
                         started_payload = payload(started)
                         self.assertEqual(started_payload["status"], "queued")
                         finished = payload(await session.call_tool("get_generation", {"generation_id": started_payload["id"]}))
                         self.assertEqual(finished["status"], "completed")
                         self.assertEqual(Path(finished["media"][0]["local_path"]).read_bytes(), content)
                     self.assertEqual(len(submitted), 2)
+                    self.assertEqual([item["max_credits"] for item in submitted], [0, 12])
                     self.assertEqual(base64.b64decode(submitted[0]["images"][0].split(",", 1)[1]), png)
         finally:
             service.shutdown()

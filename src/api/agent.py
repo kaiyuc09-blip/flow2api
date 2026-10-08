@@ -50,6 +50,7 @@ class GenerationRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=16000)
     images: List[str] = Field(default_factory=list, max_length=14)
     request_id: str = Field(default_factory=lambda: str(uuid.uuid4()), pattern=r"^[A-Za-z0-9._-]{8,128}$")
+    max_credits: int = Field(default=0, ge=0, le=1000, strict=True)
 
     @field_validator("images")
     @classmethod
@@ -94,6 +95,7 @@ async def submit_generation(body: GenerationRequest, request: Request):
         return await manager.submit(
             body.model, body.prompt, images, body.request_id,
             base_url=str(request.base_url).rstrip("/"),
+            max_credits=body.max_credits,
         )
     except RequestConflict:
         return JSONResponse(status_code=409, content={"error": {

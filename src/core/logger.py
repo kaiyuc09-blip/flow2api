@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -90,7 +91,8 @@ class DebugLogger:
     """Debug logger for API requests and responses"""
 
     def __init__(self):
-        self.log_file = Path("logs.txt")
+        self.log_file = Path(os.environ.get("FLOW2API_LOG_PATH") or "logs.txt")
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self._setup_logger()
 
     def _setup_logger(self):

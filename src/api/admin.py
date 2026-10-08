@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import importlib
+import ipaddress
 import json
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response
@@ -945,10 +946,49 @@ async def change_password(
 # ========== Token Management ==========
 
 
+@router.post("/api/personal-account/connect")
+async def connect_personal_account(
+    request: Request, token: str = Depends(verify_admin_token)
+):
+    """Connect only after an authenticated same-origin local management action."""
+    try:
+        local = bool(request.client and ipaddress.ip_address(request.client.host).is_loopback)
+        origin = urlparse(request.headers.get("origin", ""))
+        target = urlparse(str(request.base_url))
+        same_origin = (origin.scheme, origin.hostname, origin.port) == (target.scheme, target.hostname, target.port)
+        if not local or not same_origin or target.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(403, "请从本机管理页面点击连接按钮") from None
+    from ..services.personal_account import connect_personal_account as connect_account, PersonalAccountError
+    try:
+        raw_body = await request.body()
+        if len(raw_body) > 1024:
+            raise PersonalAccountError("仅接受已有项目 ID")
+        body = json.loads(raw_body)
+        if not isinstance(body, dict) or set(body) - {"project_id"}:
+            raise PersonalAccountError("仅接受已有项目 ID")
+        account = await connect_account(
+            token_manager, getattr(request.app.state, "personal_browser_service", None), body.get("project_id")
+        )
+        if concurrency_manager:
+            await concurrency_manager.reset_token(account.id, image_concurrency=1, video_concurrency=1)
+        return {"success": True, "status": "connected", "account_id": account.id}
+    except PersonalAccountError as exc:
+        raise HTTPException(400, str(exc)) from None
+    except Exception:
+        raise HTTPException(400, "连接未完成，请检查专用浏览器和本地服务状态") from None
+
+
 @router.get("/api/tokens")
 async def get_tokens(token: str = Depends(verify_admin_token)):
     """Get all tokens with statistics"""
     token_rows = await db.get_all_tokens_with_stats()
+    for row in token_rows:
+        row["personal_browser"] = row.get("account_source") == "personal_browser"
+        if row["personal_browser"]:
+            for field in ("st", "at", "google_cookies", "login_account", "login_password", "email", "name", "proxy_url", "captcha_proxy_url", "extension_route_key"):
+                row[field] = ""
     to_iso = lambda value: value.isoformat() if hasattr(value, "isoformat") else value
     now = datetime.now(timezone.utc)
 
@@ -967,6 +1007,7 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
     return [
         {
         "id": row.get("id"),
+        "personal_browser": row.get("personal_browser", False),
         "st": row.get("st"),  # Session Token for editing
         "at": row.get("at"),  # Access Token for editing (从ST转换而来)
             "at_expires": to_iso(row.get("at_expires"))
@@ -1029,9 +1070,15 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
     ]  # 直接返回数组,兼容前端
 
 
+async def _reject_manual_changes_to_native_accounts():
+    if any(item.account_source == "personal_browser" for item in await token_manager.get_all_tokens()):
+        raise HTTPException(409, "原生浏览器模式仅支持一个账号，不能混用手动或插件账号")
+
+
 @router.post("/api/tokens")
 async def add_token(request: AddTokenRequest, token: str = Depends(verify_admin_token)):
     """Add a new token"""
+    await _reject_manual_changes_to_native_accounts()
     try:
         new_token = await token_manager.add_token(
             st=request.st,
@@ -1087,8 +1134,10 @@ async def update_token(
     token_id: int, request: UpdateTokenRequest, token: str = Depends(verify_admin_token)
 ):
     """Validate current Flow cookies and update an account."""
+    existing = await token_manager.get_token(token_id)
+    if existing and existing.account_source == "personal_browser":
+        raise HTTPException(409, "原生浏览器账号仅支持启用或停用；登录态由专用浏览器管理")
     try:
-        existing = await token_manager.get_token(token_id)
         session_value = request.st or (existing.st if existing else "")
         google_cookies = request.google_cookies or (
             existing.google_cookies if existing else ""
@@ -1201,6 +1250,9 @@ async def refresh_at(token_id: int, token: str = Depends(verify_admin_token)):
     """
     from ..core.logger import debug_logger
     from ..core.config import config
+    existing = await token_manager.get_token(token_id)
+    if existing and existing.account_source == "personal_browser":
+        raise HTTPException(409, "请在专用浏览器管理原生账号的登录状态")
     
     debug_logger.log_info(
         f"[API] 手动刷新 AT 请求: token_id={token_id}, captcha_method={config.captcha_method}"
@@ -1270,6 +1322,7 @@ async def import_tokens(
     request: ImportTokensRequest, token: str = Depends(verify_admin_token)
 ):
     """Validate and import current Flow accounts."""
+    await _reject_manual_changes_to_native_accounts()
     from datetime import datetime, timezone
 
     added = 0
@@ -1315,6 +1368,8 @@ async def import_tokens(
                 existing = existing_by_email.get(email.lower())
 
                 if existing:
+                    if existing.account_source == "personal_browser":
+                        raise ValueError("原生浏览器账号不能通过导入覆盖")
                     await token_manager.update_token(
                         token_id=existing.id,
                         st=st,
@@ -2621,6 +2676,7 @@ async def plugin_update_token(
 ):
     """Validate and store credentials pushed by Token Updater 1.3+."""
     await _verify_plugin_connection_token(authorization)
+    await _reject_manual_changes_to_native_accounts()
     plugin_config = await db.get_plugin_config()
 
     google_cookies = request.google_cookies
@@ -2652,6 +2708,8 @@ async def plugin_update_token(
     existing_token = await db.get_token_by_email(email)
 
     if existing_token:
+        if existing_token.account_source == "personal_browser":
+            raise HTTPException(409, "原生浏览器账号不能通过插件覆盖")
         # Update existing token
         try:
             # Update token
@@ -2730,6 +2788,8 @@ async def plugin_check_tokens(
     rows = await db.get_all_tokens_with_stats()
     tokens = []
     for row in rows:
+        if row.get("account_source") == "personal_browser":
+            continue
         email = str(row.get("email") or "").strip()
         if email_filter and email.lower() not in email_filter:
             continue

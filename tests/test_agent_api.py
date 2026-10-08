@@ -90,6 +90,21 @@ class AgentApiTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(response.status_code, 422)
 
+    async def test_credit_limit_is_strict_and_part_of_request_identity(self):
+        request = {"model": "gemini-3.1-flash-image-landscape", "prompt": "an apple", "request_id": "credit-budget-1"}
+        for limit in (True, -1, 1001, "12", 1.5):
+            with self.subTest(limit=limit):
+                rejected = await self.client.post("/v1/agent/generations", headers=self.headers,
+                    json={**request, "max_credits": limit})
+                self.assertEqual(rejected.status_code, 422)
+        first = await self.client.post("/v1/agent/generations", headers=self.headers,
+            json={**request, "max_credits": 12})
+        self.assertEqual(first.status_code, 202)
+        self.assertEqual(first.json()["max_credits"], 12)
+        changed = await self.client.post("/v1/agent/generations", headers=self.headers,
+            json={**request, "max_credits": 13})
+        self.assertEqual(changed.status_code, 409)
+
     async def test_validation_errors_do_not_echo_reference_data(self):
         private_reference = "https://private.example/image.png?token=never-echo-this-test-value"
         response = await self.client.post("/v1/agent/generations", headers=self.headers, json={

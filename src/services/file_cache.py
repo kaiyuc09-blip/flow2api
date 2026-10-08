@@ -19,7 +19,7 @@ class FileCache:
 
     def __init__(
         self,
-        cache_dir: str = "tmp",
+        cache_dir: Optional[str] = None,
         default_timeout: int = 7200,
         proxy_manager=None,
         flow_client=None,
@@ -32,8 +32,8 @@ class FileCache:
             default_timeout: Default cache timeout in seconds (default: 2 hours)
             proxy_manager: ProxyManager instance for downloading files
         """
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
+        self.cache_dir = Path(cache_dir or os.environ.get("FLOW2API_CACHE_DIR") or "tmp")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.default_timeout = max(0, int(default_timeout))
         self.proxy_manager = proxy_manager
         self.flow_client = flow_client

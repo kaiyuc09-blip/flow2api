@@ -19,6 +19,7 @@ class Token(BaseModel):
     email: str
     name: Optional[str] = ""
     remark: Optional[str] = None
+    account_source: str = "manual"
     is_active: bool = True
     created_at: Optional[datetime] = None
     last_used_at: Optional[datetime] = None

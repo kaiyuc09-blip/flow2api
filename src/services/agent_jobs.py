@@ -13,7 +13,8 @@ from pathlib import Path
 
 import aiosqlite
 
-from .generation_policy import reset_no_submit_retry, set_no_submit_retry
+from .generation_policy import (reset_no_submit_retry, set_no_submit_retry,
+                                reset_native_credit_limit, set_native_credit_limit)
 
 
 class RequestConflict(ValueError):
@@ -52,6 +53,13 @@ def _classify_failure(error):
     # Never return upstream exception text: it can contain cookies or URLs.
     if isinstance(error, dict) and error.get("outcome_unknown"):
         return "unknown", _failure("upstream_outcome_unknown", "The upstream may have accepted the generation. Do not resubmit automatically; check the existing request in Flow.")
+    if isinstance(error, dict) and error.get("code") == "native_credit_limit":
+        cost, limit = error.get("credits_shown"), error.get("max_credits")
+        if type(cost) is int and type(limit) is int and 0 <= limit <= 1000 and cost > limit:
+            return "failed", {
+                **_failure("native_credit_limit", "Flow's displayed cost exceeds this request's budget. Nothing was submitted. Ask the user before creating a new request with a higher limit."),
+                "credits_shown": cost, "max_credits": limit, "submission_started": False,
+            }
     text = str(error).lower()
     if any(word in text for word in ("timeout", "timed out", "超时")):
         return "unknown", _failure("upstream_timeout", "Generation timed out; its upstream outcome is unknown. Do not resubmit automatically.")
@@ -82,8 +90,12 @@ class AgentJobManager:
                 id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
                 request_hash TEXT NOT NULL, model TEXT NOT NULL,
                 status TEXT NOT NULL, result_json TEXT NOT NULL,
-                created_at REAL NOT NULL, updated_at REAL NOT NULL
+                created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                max_credits INTEGER NOT NULL DEFAULT 0
             )""")
+            columns = await (await db.execute("PRAGMA table_info(agent_generations)")).fetchall()
+            if "max_credits" not in {column[1] for column in columns}:
+                await db.execute("ALTER TABLE agent_generations ADD COLUMN max_credits INTEGER NOT NULL DEFAULT 0")
             interrupted = json.dumps({"media": [], "warnings": [], "error": _failure(
                 "service_restarted", "Service stopped before the result was recorded. The upstream outcome is unknown; do not resubmit automatically.")})
             await db.execute(
@@ -111,22 +123,28 @@ class AgentJobManager:
         return {
             "id": row["id"], "request_id": row["request_id"],
             "model": row["model"], "status": row["status"],
+            "max_credits": row["max_credits"],
             "created_at": row["created_at"], "updated_at": row["updated_at"],
             "media": [], "warnings": [], "error": None,
             "upstream_model_verified": False, **result,
         }
 
     @staticmethod
-    def _request_hash(model, prompt, images):
+    def _request_hash(model, prompt, images, max_credits=0):
         digest = hashlib.sha256()
         digest.update(json.dumps([model, prompt], ensure_ascii=False).encode())
         for data in images:
             digest.update(len(data).to_bytes(8, "big"))
             digest.update(data)
+        if max_credits:
+            digest.update(b"\0credit_limit:")
+            digest.update(str(max_credits).encode())
         return digest.hexdigest()
 
-    async def submit(self, model, prompt, images, request_id, base_url=None):
-        request_hash = self._request_hash(model, prompt, images)
+    async def submit(self, model, prompt, images, request_id, base_url=None, max_credits=0):
+        if type(max_credits) is not int or not 0 <= max_credits <= 1000:
+            raise ValueError("Invalid native credit limit")
+        request_hash = self._request_hash(model, prompt, images, max_credits)
         async with self._submit_lock:
             if not self._accepting:
                 raise QueueFull("Generation service is not accepting new jobs")
@@ -144,11 +162,11 @@ class AgentJobManager:
                     raise QueueFull("Generation queue is full; retry the same request_id later")
                 job_id, now = str(uuid.uuid4()), time.time()
                 await db.execute(
-                    "INSERT INTO agent_generations VALUES (?,?,?,?,?,?,?,?)",
-                    (job_id, request_id, request_hash, model, "queued", "{}", now, now),
+                    "INSERT INTO agent_generations (id,request_id,request_hash,model,status,result_json,created_at,updated_at,max_credits) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (job_id, request_id, request_hash, model, "queued", "{}", now, now, max_credits),
                 )
                 await db.commit()
-            task = asyncio.create_task(self._run(job_id, model, prompt, list(images), base_url))
+            task = asyncio.create_task(self._run(job_id, model, prompt, list(images), base_url, max_credits))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             return await self.get(job_id)
@@ -161,9 +179,10 @@ class AgentJobManager:
             )
             await db.commit()
 
-    async def _run(self, job_id, model, prompt, images, base_url):
+    async def _run(self, job_id, model, prompt, images, base_url, max_credits=0):
         completed = None
         policy_token = set_no_submit_retry(True)
+        credit_token = set_native_credit_limit(max_credits)
         try:
             await self._save(job_id, "running")
             error = None
@@ -189,6 +208,8 @@ class AgentJobManager:
                         "upstream_model_verified": False,
                         "degraded": bool(payload.get("degraded")),
                         "warnings": _delivery_warnings(payload),
+                        "generation_transport": payload.get("generation_transport"),
+                        "native_settings": payload.get("native_settings"),
                     }
             if completed:
                 if error:
@@ -210,6 +231,7 @@ class AgentJobManager:
             await self._save(job_id, "completed" if completed else "unknown", completed or {
                 "error": _failure("execution_outcome_unknown", "The result could not be recorded. Check Flow before submitting another generation.")})
         finally:
+            reset_native_credit_limit(credit_token)
             reset_no_submit_retry(policy_token)
 
     async def close(self):
