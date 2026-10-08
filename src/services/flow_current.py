@@ -15,6 +15,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from ..core.config import config
 from ..core.logger import debug_logger
 from .browser_cookie_utils import validate_flow_cookie_storage
+from .model_capabilities import allows_native_default_image, get_parameter_preserving_captcha_method
+from .generation_policy import submission_attempts, raise_if_submission_uncertain
 
 class CurrentFlowClientMixin:
     FRONTEND_ACCESS_TOKEN = "flow-frontend-cookie"
@@ -354,9 +356,15 @@ class CurrentFlowClientMixin:
         token_image_concurrency: Optional[int] = None,
         progress_callback: Optional[Callable[[str, int], Awaitable[None]]] = None,
         google_cookies: Optional[str] = None,
+        preserve_parameters: bool = False,
     ) -> tuple[dict, str, Dict[str, Any]]:
+        native_default = not preserve_parameters and allows_native_default_image(
+            {"type": "image", "model_name": model_name, "aspect_ratio": aspect_ratio},
+            len(image_inputs or []),
+        )
+        captcha_override = None if native_default else get_parameter_preserving_captcha_method()
         await self._frontend_cookie(google_cookies, token_id)
-        max_retries = max(1, int(self._get_runtime_config().flow_max_retries or 1))
+        max_retries = submission_attempts(self._get_runtime_config().flow_max_retries)
         trace: Dict[str, Any] = {"max_retries": max_retries, "generation_attempts": []}
         last_error: Optional[Exception] = None
         cookie_storage = await self._resolve_flow_frontend_cookie_storage(
@@ -368,6 +376,7 @@ class CurrentFlowClientMixin:
         for retry_attempt in range(max_retries):
             started_at = time.time()
             browser_id = None
+            submitted = False
             attempt = {"attempt": retry_attempt + 1, "recaptcha_ok": False}
             try:
                 if progress_callback:
@@ -375,6 +384,7 @@ class CurrentFlowClientMixin:
                 personal_mode = config.captcha_method == "personal"
                 personal_native_compatible = (
                     personal_mode
+                    and native_default
                     and not image_inputs
                     and str(model_name or "").upper() == "NARWHAL"
                     and str(aspect_ratio or "").upper()
@@ -393,6 +403,7 @@ class CurrentFlowClientMixin:
                     attempt["recaptcha_ok"] = True
                     if progress_callback:
                         await progress_callback("submitting_image", 48)
+                    submitted = True
                     native_result = await personal_service.generate_native_image(
                         project_id=project_id,
                         prompt=prompt,
@@ -452,15 +463,11 @@ class CurrentFlowClientMixin:
                 # 通道与 action 必须按打码方式配套：
                 # - personal 默认纯文生横图已在上面的原子浏览器流程处理；
                 #   其他 personal 参数组合使用第三方 token + ogiZ0b，避免丢失参数。
-                # - browser harvest 使用页面原生 token/session，走 StreamChat。
+                # - browser 仅在默认横图且无参考图时沿用网页默认模型；其身份未验证。
+                # - 显式参数及 Agent 请求始终走参数完整的 RPC，不能静默丢弃选择。
                 # - 第三方打码 (yescaptcha 等)：token 只被 batchexecute 通道接受，
                 #   走原 ogiZ0b 链路，action 保持上游既有的 IMAGE_GENERATION。
-                captcha_override = (
-                    self._resolve_batchexecute_captcha_override()
-                    if personal_mode
-                    else None
-                )
-                stream_transport = config.captcha_method == "browser"
+                stream_transport = config.captcha_method == "browser" and native_default
                 token, browser_id = await self._get_recaptcha_token(
                     project_id,
                     action=(
@@ -488,6 +495,7 @@ class CurrentFlowClientMixin:
                     request_timeout = max(
                         self._get_runtime_config().flow_image_request_timeout, 90
                     )
+                    submitted = True
                     stream_result = await self._call_flow_stream_chat(
                         project_id=project_id,
                         prompt=prompt,
@@ -533,6 +541,7 @@ class CurrentFlowClientMixin:
                     trace["final_success_attempt"] = retry_attempt + 1
                     return result, harvest_session_id, trace
                 session_id = str(uuid.uuid4()).upper()
+                submitted = True
                 payload = await self._current_rpc(
                     rpc_id="ogiZ0b",
                     argument=self._build_frontend_image_generation_argument(
@@ -563,8 +572,7 @@ class CurrentFlowClientMixin:
                 attempt["error"] = str(error)[:240]
                 attempt["duration_ms"] = int((time.time() - started_at) * 1000)
                 trace["generation_attempts"].append(attempt)
-                if bool(getattr(error, "outcome_unknown", False)):
-                    raise
+                raise_if_submission_uncertain(error, submitted=submitted)
                 retry_handler = getattr(
                     self, "_handle_retryable_generation_error", None
                 )
@@ -643,6 +651,9 @@ class CurrentFlowClientMixin:
                 ),
             )
             return self._find_media_url(payload) or self._find_encoded_media(payload)
+        except Exception as error:
+            raise_if_submission_uncertain(error, submitted=True)
+            raise
         finally:
             await self._notify_browser_captcha_request_finished(browser_id)
 
@@ -665,10 +676,11 @@ class CurrentFlowClientMixin:
     ) -> dict:
         await self._frontend_cookie(google_cookies, token_id)
         captcha_override = self._resolve_batchexecute_captcha_override()
-        max_retries = max(1, int(self._get_runtime_config().flow_max_retries or 1))
+        max_retries = submission_attempts(self._get_runtime_config().flow_max_retries)
         last_error: Optional[Exception] = None
         for retry_attempt in range(max_retries):
             browser_id = None
+            submitted = False
             try:
                 token, browser_id = await self._get_recaptcha_token(
                     project_id,
@@ -695,6 +707,7 @@ class CurrentFlowClientMixin:
                     video_media_id=video_media_id,
                     resolution=resolution,
                 )
+                submitted = True
                 payload = await self._current_rpc(
                     rpc_id=rpc_id,
                     argument=argument,
@@ -712,6 +725,7 @@ class CurrentFlowClientMixin:
                 )
             except Exception as error:
                 last_error = error
+                raise_if_submission_uncertain(error, submitted=submitted)
                 # MODEL_ACCESS_DENIED 为账号权限拒绝，重试不会改变结果
                 if "MODEL_ACCESS_DENIED" in str(error):
                     raise

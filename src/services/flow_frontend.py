@@ -11,6 +11,7 @@ from curl_cffi.requests import AsyncSession
 
 from ..core.logger import debug_logger
 from .browser_cookie_utils import serialize_cookie_header_for_url
+from .generation_policy import GenerationOutcomeUnknown, no_submit_retry
 
 
 class FlowFrontendMixin:
@@ -732,6 +733,11 @@ class FlowFrontendMixin:
             [[[rpc_id, self._compact_json_dumps(argument), None, "generic"]]]
         )
         request_body = urlencode({"f.req": f_request})
+        if no_submit_retry():
+            # Avoid a challenge-driven second POST for a possibly accepted mutation.
+            at_token = self._extract_stream_chat_at_token(bootstrap_text)
+            if at_token:
+                request_body += "&at=" + quote(at_token, safe="")
         response_text = await self._make_text_request(
             method="POST",
             url=url,
@@ -744,11 +750,18 @@ class FlowFrontendMixin:
         )
         xsrf_match = re.search(r'\["xsrf","([^"]+)"', response_text)
         if xsrf_match:
+            # Confirmed read-only RPCs may safely repeat authentication; unknown
+            # RPCs are treated as mutations so new generation paths fail closed.
+            readonly_rpc = rpc_id in {"nzlxg", "as29s", "jwpduf", "GN0Bre"}
+            if no_submit_retry() and not readonly_rpc:
+                raise GenerationOutcomeUnknown(
+                    "Flow RPC returned an XSRF challenge; automatic resubmission was stopped"
+                )
             response_text = await self._make_text_request(
                 method="POST",
                 url=url,
                 headers=headers,
-                raw_body=request_body + "&at=" + quote(xsrf_match.group(1), safe=""),
+                raw_body=urlencode({"f.req": f_request, "at": xsrf_match.group(1)}),
                 timeout=timeout,
                 apply_default_client_headers=False,
                 return_error_response=True,

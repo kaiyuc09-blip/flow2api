@@ -1,5 +1,9 @@
 # Flow2API
 
+此 Fork 在上游底座上增加了面向 Codex / Claude 的 MCP 工具、可查询的异步生成任务和参数校验。安装、配置与验证范围见 [Agent 使用说明](docs/AGENT_USAGE.md)。
+
+当前已实现的 Omni 路径继续保留；Nano Banana 2.1 的 Flow 模型参数仍待真实协议验证，暂不开放调用。离线测试通过不代表真实账号、额度和最新模型已验收。
+
 <div align="center">
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

@@ -21,7 +21,8 @@ from .services.token_manager import TokenManager
 from .services.load_balancer import LoadBalancer
 from .services.concurrency_manager import ConcurrencyManager
 from .services.generation_handler import GenerationHandler
-from .api import routes, admin
+from .api import routes, admin, agent
+from .services.agent_jobs import AgentJobManager
 
 
 _LOCAL_NO_PROXY_HOSTS = ("127.0.0.1", "localhost", "::1")
@@ -120,6 +121,7 @@ async def lifespan(app: FastAPI):
 
     # 启动时统一把数据库配置同步到内存，避免 personal/brower 相关运行时配置遗漏。
     await db.reload_config_to_memory()
+    await agent_jobs.start()
     generation_handler.file_cache.set_timeout(config.cache_timeout)
     cache_cleanup_enabled = await generation_handler.file_cache.refresh_cleanup_task()
     captcha_config = await db.get_captcha_config()
@@ -232,6 +234,7 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     print("Flow2API Shutting down...")
+    await agent_jobs.close()
     # Stop file cache cleanup task
     await generation_handler.file_cache.stop_cleanup_task()
     # Stop auto-unban task
@@ -265,6 +268,7 @@ generation_handler = GenerationHandler(
     concurrency_manager,
     proxy_manager,  # 添加 proxy_manager 参数
 )
+agent_jobs = AgentJobManager(db.db_path, generation_handler)
 
 # Set dependencies
 routes.set_generation_handler(generation_handler)
@@ -277,6 +281,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+app.state.agent_jobs = agent_jobs
 
 # CORS middleware
 app.add_middleware(
@@ -290,6 +295,7 @@ app.add_middleware(
 # Include routers
 app.include_router(routes.router)
 app.include_router(admin.router)
+app.include_router(agent.router)
 
 # Static files - serve tmp directory for cached files
 tmp_dir = Path(__file__).parent.parent / "tmp"

@@ -4,7 +4,9 @@ import asyncio
 import base64
 import json
 import math
+import mimetypes
 import time
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Optional, AsyncGenerator, List, Dict, Any
 from ..core.logger import debug_logger
@@ -19,6 +21,8 @@ from ..core.account_tiers import (
     supports_model_for_tier,
 )
 from .file_cache import FileCache
+from .model_capabilities import validate_generation_transport
+from .generation_policy import GenerationOutcomeUnknown, no_submit_retry, submission_attempts
 
 
 def _video_poll_attempt_budget(
@@ -1422,6 +1426,13 @@ class GenerationHandler:
             "base_url": None,
         }
 
+    @staticmethod
+    def _add_delivery_warning(response_state: Dict[str, Any], code: str, message: str) -> None:
+        warnings = response_state.setdefault("warnings", [])
+        if not any(item.get("code") == code for item in warnings):
+            warnings.append({"code": code, "message": message})
+        response_state["degraded"] = True
+
     def _mark_generation_failed(
         self, generation_result: Optional[Dict[str, Any]], error_message: str
     ):
@@ -1575,6 +1586,7 @@ class GenerationHandler:
         stream: bool = False,
         base_url_override: Optional[str] = None,
         video_media_id: Optional[str] = None,
+        preserve_parameters: bool = False,
     ) -> AsyncGenerator:
         """统一生成入口
 
@@ -1599,6 +1611,7 @@ class GenerationHandler:
         response_state["base_url"] = (base_url_override or "").strip().rstrip(
             "/"
         ) or None
+        response_state["preserve_parameters"] = preserve_parameters
         request_log_state: Dict[str, Any] = {"id": None, "progress": 0}
 
         # 防止并发链路复用到上一次请求的指纹上下文
@@ -1614,6 +1627,13 @@ class GenerationHandler:
             return
 
         model_config = MODEL_CONFIG[model]
+        response_state["requested_model"] = model
+        response_state["resolved_model"] = model_config.get("model_name") or model_config.get("model_key")
+        try:
+            validate_generation_transport(model_config, len(images or []), preserve_parameters=preserve_parameters)
+        except ValueError as exc:
+            yield self._create_error_response(str(exc), status_code=400)
+            return
         generation_type = model_config["type"]
         video_type_for_op = model_config.get("video_type", "")
         request_operation = (
@@ -1955,6 +1975,7 @@ class GenerationHandler:
             raise
         except Exception as e:
             error_msg = f"生成失败: {str(e)}"
+            outcome_unknown = bool(getattr(e, "outcome_unknown", False))
             debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
             if token:
                 if self._should_count_token_error(e):
@@ -1986,7 +2007,7 @@ class GenerationHandler:
             )
             if stream:
                 yield self._create_stream_chunk(f"错误: {error_msg}\n")
-            yield self._create_error_response(error_msg, status_code=500)
+            yield self._create_error_response(error_msg, status_code=500, outcome_unknown=outcome_unknown)
         finally:
             if pending_token_state.get("active") and token and self.load_balancer:
                 await self.load_balancer.release_pending(
@@ -2009,6 +2030,8 @@ class GenerationHandler:
         reCAPTCHA 获取失败、验证码供应商错误、打码资源不足等问题通常不是账号本身异常；
         若将其纳入连续错误，会在回归测试或代理波动时把 token 自动打成 inactive。
         """
+        if getattr(error, "outcome_unknown", False):
+            return False
         error_text = str(error or "").strip().lower()
         if not error_text:
             return True
@@ -2152,6 +2175,7 @@ class GenerationHandler:
                 token_image_concurrency=token.image_concurrency,
                 progress_callback=_image_progress_callback,
                 google_cookies=getattr(token, "google_cookies", None),
+                preserve_parameters=bool(response_state.get("preserve_parameters")) or bool(model_config.get("upsample")),
             )
             if image_trace is not None:
                 image_trace["generate_api_ms"] = int(
@@ -2211,7 +2235,7 @@ class GenerationHandler:
                     )
 
                 # 4K/2K 图片重试逻辑 - 使用配置的最大重试次数
-                max_retries = config.flow_max_retries
+                max_retries = submission_attempts(config.flow_max_retries)
                 for retry_attempt in range(max_retries):
                     try:
                         # 调用 upsample API
@@ -2261,6 +2285,7 @@ class GenerationHandler:
                                     yield self._create_completion_response(
                                         encoded_image,
                                         media_type="image",
+                                        response_state=response_state,
                                     )
                                 if image_trace is not None:
                                     image_trace["upsample_ms"] = int(
@@ -2303,7 +2328,7 @@ class GenerationHandler:
                                     )
                                 else:
                                     yield self._create_completion_response(
-                                        local_url, media_type="image"
+                                        local_url, media_type="image", response_state=response_state
                                     )
                                 if image_trace is not None:
                                     image_trace["upsample_ms"] = int(
@@ -2314,6 +2339,7 @@ class GenerationHandler:
                                 debug_logger.log_error(
                                     f"Failed to cache {resolution_name} image: {str(e)}"
                                 )
+                                self._add_delivery_warning(response_state, "cache_failed", "放大图片保存失败，返回内联图片；未生成持久文件")
                                 response_state["url"] = image_url
                                 response_state["generated_assets"]["upscaled_image"][
                                     "local_url"
@@ -2339,7 +2365,7 @@ class GenerationHandler:
                                     )
                                 else:
                                     yield self._create_completion_response(
-                                        base64_url, media_type="image"
+                                        base64_url, media_type="image", response_state=response_state
                                     )
                                 if image_trace is not None:
                                     image_trace["upsample_ms"] = int(
@@ -2356,13 +2382,15 @@ class GenerationHandler:
 
                     except Exception as e:
                         error_str = str(e)
+                        if getattr(e, "outcome_unknown", False):
+                            self._add_delivery_warning(response_state, "image_upsample_outcome_unknown", "图片放大结果未知，未重新提交；交付已生成的原始图片")
                         debug_logger.log_error(
                             f"[UPSAMPLE] 放大失败 (尝试 {retry_attempt + 1}/{max_retries}): {error_str}"
                         )
                         
                         # 检查是否是可重试错误（403、reCAPTCHA、超时等）
                         retry_reason = self.flow_client._get_retry_reason(error_str)
-                        if retry_reason and retry_attempt < max_retries - 1:
+                        if retry_reason and retry_attempt < max_retries - 1 and not getattr(e, "outcome_unknown", False):
                             if stream:
                                 yield self._create_stream_chunk(
                                     f"⚠️ 放大遇到{retry_reason}，正在重试 ({retry_attempt + 2}/{max_retries})...\n"
@@ -2382,6 +2410,7 @@ class GenerationHandler:
                     )
                 # 放大失败回退原图时记录失败标记，便于调用方感知实际交付分辨率
                 if upsample_resolution and media_id:
+                    self._add_delivery_warning(response_state, "image_upsample_failed", "图片放大失败，交付原始图片；请求分辨率未实现")
                     response_state.setdefault("generated_assets", {})[
                         "upscaled_image"
                     ] = {
@@ -2389,6 +2418,9 @@ class GenerationHandler:
                         "failed": True,
                         "delivery_mode": "origin_fallback",
                     }
+
+            if upsample_resolution and not media_id:
+                self._add_delivery_warning(response_state, "image_upsample_failed", "上游未返回媒体标识，无法放大；交付原始图片")
 
             local_url = image_url
             cache_started_at = time.time()
@@ -2414,6 +2446,7 @@ class GenerationHandler:
                         )
                 except Exception as e:
                     debug_logger.log_error(f"Failed to cache 1K image: {str(e)}")
+                    self._add_delivery_warning(response_state, "cache_failed", "图片保存失败，返回可能过期的上游链接")
                     local_url = image_url
                     if stream:
                         cache_error = self._normalize_error_message(e, max_length=120)
@@ -2452,6 +2485,7 @@ class GenerationHandler:
                 yield self._create_completion_response(
                     local_url,  # 直接传URL,让方法内部格式化
                     media_type="image",
+                    response_state=response_state,
                 )
 
         finally:
@@ -2527,6 +2561,11 @@ class GenerationHandler:
 
             # 图片数量
             image_count = len(images) if images else 0
+            response_state["resolved_model"] = (
+                model_config.get("reference_model_key", model_key)
+                if video_type == "omni" and image_count
+                else model_key
+            )
 
             # ========== 验证和处理图片 ==========
 
@@ -2797,10 +2836,10 @@ class GenerationHandler:
 
             direct_video_url = str(result.get("video_url") or "").strip()
             if result.get("direct_media") and direct_video_url:
-                await self.token_manager.record_usage(token.id, is_video=True)
-                await self.token_manager.record_success(token.id)
-                if getattr(self, "load_balancer", None):
-                    self.load_balancer.clear_quota_cooldown(token.id, model_key)
+                # Usage is recorded once by handle_generation after successful delivery.
+                clear_cooldown = getattr(getattr(self, "load_balancer", None), "clear_quota_cooldown", None)
+                if callable(clear_cooldown):
+                    clear_cooldown(token.id, model_key)
                 if self.proxy_manager and hasattr(
                     self.proxy_manager,
                     "record_attempt_success",
@@ -2861,6 +2900,7 @@ class GenerationHandler:
                     yield self._create_completion_response(
                         direct_video_url,
                         media_type="video",
+                        response_state=response_state,
                     )
                 return
 
@@ -2955,6 +2995,7 @@ class GenerationHandler:
         consecutive_poll_errors = 0
         last_poll_error: Optional[Exception] = None
         max_consecutive_poll_errors = 3
+        upsample_submitted = False
 
         for attempt in range(max_attempts):
             remaining = poll_deadline - time.monotonic()
@@ -3085,6 +3126,10 @@ class GenerationHandler:
 
                     # ========== 视频放大处理 ==========
                     if upsample_config and video_media_id:
+                        if no_submit_retry() and upsample_submitted:
+                            raise GenerationOutcomeUnknown(
+                                "Video upsample was already submitted; automatic resubmission was stopped"
+                            )
                         if stream:
                             resolution_name = (
                                 "4K"
@@ -3097,6 +3142,7 @@ class GenerationHandler:
                         
                         try:
                             # 提交放大任务
+                            upsample_submitted = True
                             upsample_result = await self.flow_client.upsample_video(
                                 at=token.at,
                                 project_id=project_id,
@@ -3131,12 +3177,16 @@ class GenerationHandler:
                                     yield chunk
                                 return
                             else:
+                                self._add_delivery_warning(response_state, "video_upsample_failed", "视频放大未创建任务，交付原始视频")
                                 if stream:
                                     yield self._create_stream_chunk(
                                         "⚠️ 放大任务创建失败，返回原始视频\n"
                                     )
                         except Exception as e:
                             debug_logger.log_error(f"Video upsample failed: {str(e)}")
+                            if getattr(e, "outcome_unknown", False):
+                                self._add_delivery_warning(response_state, "video_upsample_outcome_unknown", "视频放大结果未知，未重新提交；交付已生成的原始视频")
+                            self._add_delivery_warning(response_state, "video_upsample_failed", "视频放大失败，交付原始视频；请求分辨率未实现")
                             if stream:
                                 yield self._create_stream_chunk(
                                     f"⚠️ 放大失败: {str(e)}，返回原始视频\n"
@@ -3173,6 +3223,7 @@ class GenerationHandler:
                                 )
                         except Exception as e:
                             debug_logger.log_error(f"Failed to cache video: {str(e)}")
+                            self._add_delivery_warning(response_state, "cache_failed", "视频保存失败，返回可能过期的上游链接")
                             # 缓存失败不影响结果返回,使用原始URL
                             local_url = video_url
                             if stream:
@@ -3223,6 +3274,7 @@ class GenerationHandler:
                         yield self._create_completion_response(
                             local_url,  # 直接传URL,让方法内部格式化
                             media_type="video",
+                            response_state=response_state,
                         )
                     return
 
@@ -3254,6 +3306,8 @@ class GenerationHandler:
                     return
                     
             except Exception as e:
+                if getattr(e, "outcome_unknown", False):
+                    raise
                 last_poll_error = e
                 consecutive_poll_errors += 1
                 debug_logger.log_error(f"Poll error: {str(e)}")
@@ -3308,6 +3362,7 @@ class GenerationHandler:
         content: str,
         media_type: str = "image",
         is_availability_check: bool = False,
+        response_state: Optional[Dict[str, Any]] = None,
     ) -> str:
         """创建非流式响应
 
@@ -3348,9 +3403,27 @@ class GenerationHandler:
             ],
         }
 
+        if not is_availability_check:
+            state = response_state or {}
+            mime_type = None
+            if content.startswith("data:"):
+                mime_type = content[5:].partition(";")[0].partition(",")[0] or None
+            else:
+                mime_type = mimetypes.guess_type(urlparse(content).path)[0]
+            warnings = list(state.get("warnings") or [])
+            response.update(
+                media=[{"url": content, "type": media_type, "mime_type": mime_type}],
+                requested_model=state.get("requested_model"),
+                resolved_model=state.get("resolved_model"),
+                upstream_model_verified=False,
+                actual_upstream_model="unknown",
+                warnings=warnings,
+                degraded=bool(state.get("degraded", False)),
+            )
+
         return json.dumps(response, ensure_ascii=False)
 
-    def _create_error_response(self, error_message: str, status_code: int = 500) -> str:
+    def _create_error_response(self, error_message: str, status_code: int = 500, *, outcome_unknown: bool = False) -> str:
         """创建错误响应"""
         import json
 
@@ -3364,6 +3437,8 @@ class GenerationHandler:
                 "status_code": status_code,
             }
         }
+        if outcome_unknown:
+            error["error"]["outcome_unknown"] = True
 
         return json.dumps(error, ensure_ascii=False)
 

@@ -1,0 +1,222 @@
+"""Durable Agent jobs around the existing generation pipeline.
+
+One service worker owns execution. A lost HTTP connection never cancels a job;
+after a process restart unfinished work is UNKNOWN and is never resubmitted.
+"""
+
+import asyncio
+import hashlib
+import json
+import time
+import uuid
+from pathlib import Path
+
+import aiosqlite
+
+from .generation_policy import reset_no_submit_retry, set_no_submit_retry
+
+
+class RequestConflict(ValueError):
+    pass
+
+
+class QueueFull(RuntimeError):
+    pass
+
+
+def _failure(code, message):
+    return {"code": code, "message": message, "retryable": False}
+
+
+def _delivery_warnings(payload):
+    messages = {
+        "cache_failed": "Media caching failed; delivery may use an expiring URL or inline image.",
+        "image_upsample_failed": "Image upscaling failed; the requested resolution was not delivered.",
+        "video_upsample_failed": "Video upscaling failed; the requested resolution was not delivered.",
+        "image_upsample_outcome_unknown": "Image upscaling may have been accepted upstream. The original image is delivered; do not retry upscaling automatically.",
+        "video_upsample_outcome_unknown": "Video upscaling may have been accepted upstream. The original video is delivered; do not retry upscaling automatically.",
+    }
+    warnings = []
+    for warning in payload.get("warnings") or []:
+        code = warning.get("code") if isinstance(warning, dict) else None
+        if code not in messages:
+            code = "upstream_warning"
+        if not any(item["code"] == code for item in warnings):
+            warnings.append({"code": code, "message": messages.get(code, "The upstream reported a delivery warning.")})
+    if payload.get("degraded") and not warnings:
+        warnings.append({"code": "degraded_delivery", "message": "The requested output was degraded."})
+    return warnings
+
+
+def _classify_failure(error):
+    # Never return upstream exception text: it can contain cookies or URLs.
+    if isinstance(error, dict) and error.get("outcome_unknown"):
+        return "unknown", _failure("upstream_outcome_unknown", "The upstream may have accepted the generation. Do not resubmit automatically; check the existing request in Flow.")
+    text = str(error).lower()
+    if any(word in text for word in ("timeout", "timed out", "超时")):
+        return "unknown", _failure("upstream_timeout", "Generation timed out; its upstream outcome is unknown. Do not resubmit automatically.")
+    if any(word in text for word in ("captcha", "验证码", "打码")):
+        return "failed", _failure("captcha_failed", "Flow verification failed. Check the configured verification service.")
+    if any(word in text for word in ("credit", "quota", "余额", "积分")):
+        return "failed", _failure("quota_unavailable", "The account has insufficient quota or is rate limited.")
+    if any(word in text for word in ("token", "cookie", "credential", "unauthor", "过期", "账号")):
+        return "failed", _failure("account_unavailable", "A usable Flow account or session is required.")
+    return "failed", _failure("upstream_generation_failed", "Flow did not complete the generation. Check the account and service status before retrying.")
+
+
+class AgentJobManager:
+    """Persist results and idempotency separately from upstream operation IDs."""
+
+    def __init__(self, db_path, handler, max_pending=8):
+        self.db_path = str(db_path)
+        self.handler = handler
+        self.max_pending = max_pending
+        self._tasks = set()
+        self._submit_lock = asyncio.Lock()
+        self._accepting = False
+
+    async def start(self):
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+        async with aiosqlite.connect(self.db_path, timeout=30) as db:
+            await db.execute("""CREATE TABLE IF NOT EXISTS agent_generations (
+                id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
+                request_hash TEXT NOT NULL, model TEXT NOT NULL,
+                status TEXT NOT NULL, result_json TEXT NOT NULL,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL
+            )""")
+            interrupted = json.dumps({"media": [], "warnings": [], "error": _failure(
+                "service_restarted", "Service stopped before the result was recorded. The upstream outcome is unknown; do not resubmit automatically.")})
+            await db.execute(
+                "UPDATE agent_generations SET status='unknown', result_json=?, updated_at=? WHERE status IN ('queued','running')",
+                (interrupted, time.time()),
+            )
+            await db.commit()
+        self._accepting = True
+
+    async def get(self, job_id):
+        return await self._find("id", job_id)
+
+    async def get_by_request_id(self, request_id):
+        return await self._find("request_id", request_id)
+
+    async def _find(self, column, value):
+        assert column in ("id", "request_id")
+        async with aiosqlite.connect(self.db_path, timeout=30) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(f"SELECT * FROM agent_generations WHERE {column}=?", (value,))
+            row = await cursor.fetchone()
+        if not row:
+            return None
+        result = json.loads(row["result_json"])
+        return {
+            "id": row["id"], "request_id": row["request_id"],
+            "model": row["model"], "status": row["status"],
+            "created_at": row["created_at"], "updated_at": row["updated_at"],
+            "media": [], "warnings": [], "error": None,
+            "upstream_model_verified": False, **result,
+        }
+
+    @staticmethod
+    def _request_hash(model, prompt, images):
+        digest = hashlib.sha256()
+        digest.update(json.dumps([model, prompt], ensure_ascii=False).encode())
+        for data in images:
+            digest.update(len(data).to_bytes(8, "big"))
+            digest.update(data)
+        return digest.hexdigest()
+
+    async def submit(self, model, prompt, images, request_id, base_url=None):
+        request_hash = self._request_hash(model, prompt, images)
+        async with self._submit_lock:
+            if not self._accepting:
+                raise QueueFull("Generation service is not accepting new jobs")
+            async with aiosqlite.connect(self.db_path, timeout=30) as db:
+                await db.execute("BEGIN IMMEDIATE")
+                cursor = await db.execute(
+                    "SELECT id,request_hash FROM agent_generations WHERE request_id=?", (request_id,))
+                old = await cursor.fetchone()
+                if old:
+                    if old[1] != request_hash:
+                        raise RequestConflict("request_id was already used with different generation parameters")
+                    await db.rollback()
+                    return await self.get(old[0])
+                if len(self._tasks) >= self.max_pending:
+                    raise QueueFull("Generation queue is full; retry the same request_id later")
+                job_id, now = str(uuid.uuid4()), time.time()
+                await db.execute(
+                    "INSERT INTO agent_generations VALUES (?,?,?,?,?,?,?,?)",
+                    (job_id, request_id, request_hash, model, "queued", "{}", now, now),
+                )
+                await db.commit()
+            task = asyncio.create_task(self._run(job_id, model, prompt, list(images), base_url))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+            return await self.get(job_id)
+
+    async def _save(self, job_id, status, result=None):
+        async with aiosqlite.connect(self.db_path, timeout=30) as db:
+            await db.execute(
+                "UPDATE agent_generations SET status=?, result_json=?, updated_at=? WHERE id=?",
+                (status, json.dumps(result or {}, ensure_ascii=False), time.time(), job_id),
+            )
+            await db.commit()
+
+    async def _run(self, job_id, model, prompt, images, base_url):
+        completed = None
+        policy_token = set_no_submit_retry(True)
+        try:
+            await self._save(job_id, "running")
+            error = None
+            async for chunk in self.handler.handle_generation(
+                model=model, prompt=prompt, images=images or None, stream=False,
+                base_url_override=base_url, preserve_parameters=True,
+            ):
+                payload = json.loads(chunk) if isinstance(chunk, str) else chunk
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("error"):
+                    error = payload["error"]
+                media = payload.get("media")
+                if isinstance(media, list) and media and all(
+                    isinstance(item, dict) and item.get("url") and item.get("type") in ("image", "video")
+                    for item in media
+                ):
+                    completed = {
+                        "media": media, "error": None,
+                        "requested_model": model,
+                        "resolved_model": payload.get("resolved_model", model),
+                        "actual_upstream_model": payload.get("actual_upstream_model", "unknown"),
+                        "upstream_model_verified": False,
+                        "degraded": bool(payload.get("degraded")),
+                        "warnings": _delivery_warnings(payload),
+                    }
+            if completed:
+                if error:
+                    completed["warnings"].append({"code": "bookkeeping_failed", "message": "The media was generated, but subsequent bookkeeping reported an error."})
+                await self._save(job_id, "completed", completed)
+            elif error:
+                status, public_error = _classify_failure(error)
+                await self._save(job_id, status, {"error": public_error})
+            else:
+                await self._save(job_id, "unknown", {"error": _failure(
+                    "missing_media_result", "No structured media result was recorded. Do not resubmit automatically.")})
+        except asyncio.CancelledError:
+            await self._save(job_id, "completed" if completed else "unknown", completed or {
+                "error": _failure("execution_interrupted", "Local processing stopped; the upstream outcome is unknown. Do not resubmit automatically.")})
+            raise
+        except Exception:
+            # Exceptions outside an explicit upstream rejection may occur after
+            # submission; do not claim a safe-to-retry failure.
+            await self._save(job_id, "completed" if completed else "unknown", completed or {
+                "error": _failure("execution_outcome_unknown", "The result could not be recorded. Check Flow before submitting another generation.")})
+        finally:
+            reset_no_submit_retry(policy_token)
+
+    async def close(self):
+        async with self._submit_lock:
+            self._accepting = False
+            tasks = list(self._tasks)
+            for task in tasks:
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)

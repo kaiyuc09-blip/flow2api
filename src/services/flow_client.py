@@ -5141,7 +5141,7 @@ class _FlowClientBase(FlowFrontendMixin):
                         else None
                     )
                 debug_logger.log_info(
-                    f"[reCAPTCHA] get_token 返回: {token[:50] if token else None}..."
+                    f"[reCAPTCHA] get_token 成功: {bool(token)}"
                 )
                 fingerprint = (
                     solve_bundle.get("fingerprint")
