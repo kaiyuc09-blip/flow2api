@@ -81,6 +81,8 @@ def main():
         "FLOW2API_LOG_PATH": str(directory / "service.log"),
         "PERSONAL_BROWSER_USER_DATA_DIR": str(directory / "browser-profile"),
         "PERSONAL_BROWSER_HEADLESS": "false",
+        # Native UI uses normal Chrome defaults instead of the legacy captcha flags.
+        "PERSONAL_BROWSER_BARE_MODE": os.environ.get("PERSONAL_BROWSER_BARE_MODE", "1"),
         "PERSONAL_BROWSER_FRESH_RESTART_EVERY_N_SOLVES": "0",
         "BROWSER_EXECUTABLE_PATH": str(args.browser),
     })
