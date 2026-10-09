@@ -2,13 +2,21 @@
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+import asyncio
 import base64
+import binascii
+import io
+import ipaddress
 import json
 import mimetypes
 import re
-from urllib.parse import urlparse
+import socket
+import warnings
+from urllib.parse import unquote, urljoin, urlparse
 
+from curl_cffi import CurlOpt
 from curl_cffi.requests import AsyncSession
+from PIL import Image, UnidentifiedImageError
 from fastapi import (
     APIRouter,
     Depends,
@@ -21,6 +29,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..core.auth import AuthManager, verify_api_key_flexible
+from ..core.config import config
 from ..core.logger import debug_logger
 from ..core.model_resolver import get_base_model_aliases, resolve_model_name
 from ..core.models import (
@@ -37,6 +46,12 @@ router = APIRouter()
 MARKDOWN_IMAGE_RE = re.compile(r"!\[.*?\]\((.*?)\)")
 HTML_VIDEO_RE = re.compile(r"<video[^>]+src=['\"](.*?)['\"]", re.IGNORECASE)
 DATA_URL_RE = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<data>.+)$", re.DOTALL)
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
+SUPPORTED_IMAGE_MIMES = {
+    "PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp",
+    "GIF": "image/gif", "AVIF": "image/avif", "BMP": "image/bmp",
+}
 MEDIA_PROMPT_TOOL_BLOCK_RE = re.compile(
     r"<tools>.*?</tools>", re.IGNORECASE | re.DOTALL
 )
@@ -159,11 +174,44 @@ def _build_gemini_model_resource(model_id: str, description: str) -> Dict[str, A
     }
 
 
+def _validate_image_bytes(image_bytes: bytes, mime_type: Optional[str] = None) -> bytes:
+    """Reject corrupt, oversized, or non-image references before upstream upload."""
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image exceeds the 20 MiB limit")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(image_bytes)) as image:
+                actual_mime = SUPPORTED_IMAGE_MIMES.get(image.format)
+                if actual_mime is None:
+                    raise ValueError("Unsupported image format")
+                if image.width * image.height > MAX_IMAGE_PIXELS:
+                    raise ValueError("Image dimensions exceed limit")
+                if mime_type and mime_type.lower() != actual_mime:
+                    raise ValueError("Image MIME type does not match content")
+                image.verify()
+            # verify() checks structure; load() also detects truncated pixel data.
+            with Image.open(io.BytesIO(image_bytes)) as image:
+                image.load()
+    except (ValueError, OSError, SyntaxError, UnidentifiedImageError,
+            Image.DecompressionBombError, Image.DecompressionBombWarning):
+        raise HTTPException(status_code=400, detail="Invalid or unsupported image content") from None
+    return image_bytes
+
+
 def _decode_data_url(data_url: str) -> tuple[str, bytes]:
     match = DATA_URL_RE.match(data_url)
     if not match:
         raise HTTPException(status_code=400, detail="Invalid data URL")
-    return match.group("mime"), base64.b64decode(match.group("data"))
+    encoded = match.group("data")
+    if len(encoded) > 4 * ((MAX_IMAGE_BYTES + 2) // 3):
+        raise HTTPException(status_code=413, detail="Image exceeds the 20 MiB limit")
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error):
+        raise HTTPException(status_code=400, detail="Invalid base64 image content") from None
+    mime_type = match.group("mime").lower()
+    return mime_type, _validate_image_bytes(image_bytes, mime_type)
 
 
 def _detect_image_mime_type(image_bytes: bytes, fallback: str = "image/png") -> str:
@@ -183,52 +231,144 @@ def _guess_mime_type(uri: str, fallback: str) -> str:
     return guessed or fallback
 
 
+async def _validate_remote_image_url(url: str) -> tuple[str, int, list[str]]:
+    """Validate the destination, including DNS results, before each request."""
+    try:
+        parsed = urlparse(url)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or "\\" in url or any(ord(char) < 32 for char in url)):
+            raise ValueError()
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            addresses = [str(ipaddress.ip_address(host))]
+        except ValueError:
+            records = await asyncio.to_thread(
+                socket.getaddrinfo, host, port, type=socket.SOCK_STREAM
+            )
+            addresses = list(dict.fromkeys(record[4][0] for record in records))
+        if not addresses or any(
+            not ipaddress.ip_address(address).is_global
+            for address in addresses
+        ):
+            raise ValueError()
+        return host, port, addresses
+    except (ValueError, OSError):
+        raise HTTPException(status_code=400, detail="Image URL destination is not permitted") from None
+
+
+def _cache_relative_path(url: str) -> Optional[str]:
+    """Only relative cache URLs and the configured service origin map to disk."""
+    try:
+        parsed = urlparse(url)
+        if not parsed.scheme and not parsed.netloc:
+            return parsed.path
+        if parsed.username is not None or parsed.password is not None:
+            return None
+        host = (config.server_host or "").strip()
+        if host in {"", "0.0.0.0", "::", "[::]"}:
+            host = "127.0.0.1"
+        elif ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        base = urlparse(config.cache_base_url or f"http://{host}:{config.server_port}")
+        def origin(parts):
+            return (parts.scheme, parts.hostname,
+                    parts.port or (443 if parts.scheme == "https" else 80))
+        prefix = base.path.rstrip("/") + "/tmp/"
+        if origin(parsed) == origin(base) and parsed.path.startswith(prefix):
+            return "/tmp/" + parsed.path[len(prefix):]
+        return None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid image URI") from None
+
+
 async def retrieve_image_data(url: str) -> Optional[bytes]:
     """Read image bytes from local /tmp cache or remote URL."""
     file_cache = getattr(generation_handler, "file_cache", None)
-    try:
-        if "/tmp/" in url and file_cache:
-            path = urlparse(url).path
-            filename = path.split("/tmp/")[-1]
-            local_file_path = file_cache.cache_dir / filename
-
-            if local_file_path.exists() and local_file_path.is_file():
-                data = local_file_path.read_bytes()
-                if data:
-                    return data
-    except Exception as exc:
-        debug_logger.log_warning(f"[CONTEXT] 本地缓存读取失败: {str(exc)}")
+    cache_path = _cache_relative_path(url)
+    if cache_path is not None:
+        if not cache_path.startswith("/tmp/") or file_cache is None:
+            raise HTTPException(status_code=400, detail="Invalid cache image URI")
+        filename = unquote(cache_path[len("/tmp/"):])
+        if not filename or filename in {".", ".."} or any(
+            char in filename for char in ("/", "\\", "%", "\x00")
+        ):
+            raise HTTPException(status_code=400, detail="Invalid cache image URI")
+        cache_dir = file_cache.cache_dir.resolve()
+        local_file_path = (cache_dir / filename).resolve()
+        if local_file_path.parent != cache_dir:
+            raise HTTPException(status_code=400, detail="Invalid cache image URI")
+        try:
+            if not local_file_path.is_file():
+                return None
+            with local_file_path.open("rb") as source:
+                return _validate_image_bytes(source.read(MAX_IMAGE_BYTES + 1))
+        except OSError:
+            return None
 
     proxy_url = None
     try:
         if file_cache and hasattr(file_cache, "_resolve_download_proxy"):
             proxy_url = await file_cache._resolve_download_proxy("image")
-    except Exception as exc:
-        debug_logger.log_warning(f"[CONTEXT] 图片下载代理解析失败: {str(exc)}")
+    except Exception:
+        debug_logger.log_warning("[CONTEXT] 图片下载代理解析失败")
 
     try:
-        async with AsyncSession() as session:
-            response = await session.get(
-                url,
-                timeout=60,
-                proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
-                headers={
-                    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    "Connection": "keep-alive",
-                    "Referer": "https://flow.google.com/",
-                },
-                impersonate="chrome120",
-                verify=False,
-            )
-            if response.status_code == 200 and response.content:
-                return response.content
-            debug_logger.log_warning(
-                f"[CONTEXT] 图片下载失败，状态码: {response.status_code}"
-            )
-    except Exception as exc:
-        debug_logger.log_error(f"[CONTEXT] 图片下载异常: {str(exc)}")
+        for _ in range(6):
+            host, port, addresses = await _validate_remote_image_url(url)
+            # Pin the connection itself, preserving the URL's hostname for TLS.
+            # CONNECT_TO also avoids a second DNS lookup by a configured proxy.
+            target = f"[{addresses[0]}]" if ":" in addresses[0] else addresses[0]
+            source_host = f"[{host}]" if ":" in host else host
+            options = {CurlOpt.CONNECT_TO: [f"{source_host}:{port}:{target}:{port}"]}
+            if proxy_url:
+                options[CurlOpt.HTTPPROXYTUNNEL] = 1
+            else:
+                # curl_cffi's trust_env flag does not disable libcurl env proxies.
+                options[CurlOpt.PROXY] = ""
+            async with AsyncSession(curl_options=options, trust_env=False) as session:
+                response = await session.get(
+                    url,
+                    timeout=60,
+                    proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
+                    headers={
+                        "Accept": "image/avif,image/webp,image/png,image/jpeg,image/*",
+                        "Referer": "https://flow.google.com/",
+                    },
+                    impersonate="chrome120",
+                    verify=True,
+                    allow_redirects=False,
+                    stream=True,
+                )
+                try:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("Location")
+                        if not location:
+                            return None
+                        url = urljoin(url, location)
+                        continue
+                    if response.status_code != 200:
+                        debug_logger.log_warning(
+                            f"[CONTEXT] 图片下载失败，状态码: {response.status_code}"
+                        )
+                        return None
+                    length = response.headers.get("Content-Length", "")
+                    if length.isdigit() and int(length) > MAX_IMAGE_BYTES:
+                        raise HTTPException(status_code=413, detail="Image exceeds the 20 MiB limit")
+                    content = bytearray()
+                    async for chunk in response.aiter_content():
+                        if len(content) + len(chunk) > MAX_IMAGE_BYTES:
+                            raise HTTPException(status_code=413, detail="Image exceeds the 20 MiB limit")
+                        content.extend(chunk)
+                    return _validate_image_bytes(bytes(content))
+                finally:
+                    await response.aclose()
+        raise HTTPException(status_code=400, detail="Too many image URL redirects")
+    except HTTPException:
+        raise
+    except Exception:
+        debug_logger.log_error("[CONTEXT] 图片下载异常")
 
     return None
 
@@ -241,13 +381,13 @@ async def _load_image_bytes_from_uri(uri: str) -> bytes:
         _, image_bytes = _decode_data_url(uri)
         return image_bytes
 
-    if uri.startswith("http://") or uri.startswith("https://") or "/tmp/" in uri:
+    if uri.startswith(("http://", "https://", "/tmp/")):
         image_bytes = await retrieve_image_data(uri)
         if image_bytes:
             return image_bytes
-        raise HTTPException(status_code=400, detail=f"Failed to load image from {uri}")
+        raise HTTPException(status_code=400, detail="Failed to load image")
 
-    raise HTTPException(status_code=400, detail=f"Unsupported image URI: {uri}")
+    raise HTTPException(status_code=400, detail="Unsupported image URI")
 
 
 def _coerce_gemini_contents(raw_contents: Optional[List[Any]]) -> List[GeminiContent]:
@@ -361,13 +501,9 @@ async def _append_openai_reference_images(
                     downloaded_bytes = await retrieve_image_data(image_url)
                     if downloaded_bytes:
                         images.insert(0, downloaded_bytes)
-                        debug_logger.log_info(
-                            f"[CONTEXT] ✅ 添加历史参考图: {image_url}"
-                        )
+                        debug_logger.log_info("[CONTEXT] ✅ 已添加历史参考图")
                         return images
-                    debug_logger.log_warning(
-                        f"[CONTEXT] 图片下载失败或为空，尝试下一个: {image_url}"
-                    )
+                    debug_logger.log_warning("[CONTEXT] 图片下载失败或为空，尝试下一个")
                 except Exception as exc:
                     debug_logger.log_error(f"[CONTEXT] 处理参考图时出错: {str(exc)}")
     return images
@@ -403,7 +539,10 @@ async def _extract_prompt_and_images_from_gemini_contents(
                     status_code=400,
                     detail=f"Unsupported inlineData mime type: {part.inlineData.mimeType}",
                 )
-            images.append(base64.b64decode(part.inlineData.data))
+            _, image_bytes = _decode_data_url(
+                f"data:{mime_type};base64,{part.inlineData.data}"
+            )
+            images.append(image_bytes)
         elif part.fileData is not None:
             mime_type = (part.fileData.mimeType or "").lower()
             if mime_type and not mime_type.startswith("image/"):

@@ -372,6 +372,7 @@ class TokenManager:
         proxy_url: Optional[str] = None,
         auto_refresh_enabled: bool = True,
         refresh_interval_minutes: int = 120,
+        account_source: str = "manual",
     ) -> Token:
         """Add a new token and prepare its pooled projects."""
         if not st and google_cookies:
@@ -402,6 +403,9 @@ class TokenManager:
             if existing_identity:
                 raise ValueError(f"账号已存在: {email}")
             name = user_info.get("name", email.split("@")[0] if email else "")
+            if account_source == "personal_browser":
+                # Native accounts are selected by internal ID, never personal identity.
+                email, name = "native-browser@flow.local", "Native browser"
             at_expires = None
             if expires:
                 try:
@@ -425,7 +429,7 @@ class TokenManager:
             user_paygate_tier = None
 
         base_project_name = self._normalize_project_name_base(project_name)
-        project_pool_size = self._get_project_pool_size()
+        project_pool_size = 1 if account_source == "personal_browser" else self._get_project_pool_size()
         pooled_projects: List[Project] = []
 
         if project_id:
@@ -470,6 +474,7 @@ class TokenManager:
             email=email,
             name=name,
             remark=remark,
+            account_source=account_source,
             is_active=True,
             credits=credits,
             user_paygate_tier=user_paygate_tier,
@@ -1166,6 +1171,10 @@ class TokenManager:
             token = await self.db.get_token(token_id)
             if not token:
                 raise ValueError("Token not found")
+            if token.account_source == "personal_browser":
+                if not token.current_project_id:
+                    raise ValueError("原生浏览器账号需要已有 Flow 项目")
+                return token.current_project_id
 
             projects = [
                 project

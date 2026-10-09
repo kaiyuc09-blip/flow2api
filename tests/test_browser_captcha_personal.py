@@ -556,9 +556,8 @@ class BrowserCaptchaPersonalTests(unittest.IsolatedAsyncioTestCase):
         client._build_flow_frontend_project_page_url = (
             lambda project_id: f"https://flow.google.com/project/{project_id}"
         )
-        client._resolve_batchexecute_captcha_override = MagicMock(
-            return_value="yescaptcha"
-        )
+        # The public generation preflight now checks configured transport
+        # credentials before requesting a CAPTCHA; use a synthetic setting.
         client._get_recaptcha_token = AsyncMock(
             return_value=("captcha-token", None)
         )
@@ -576,7 +575,10 @@ class BrowserCaptchaPersonalTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(
             type(config), "captcha_method", new_callable=PropertyMock
-        ) as captcha_method:
+        ) as captcha_method, patch.object(
+            type(config), "yescaptcha_api_key", new_callable=PropertyMock,
+            return_value="test-only",
+        ):
             captcha_method.return_value = "personal"
             await client.generate_image(
                 at="at-token",

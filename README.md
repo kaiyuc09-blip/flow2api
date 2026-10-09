@@ -1,5 +1,9 @@
 # Flow2API
 
+此 Fork 在上游底座上增加了面向 Codex / Claude 的 MCP 工具、可查询的异步生成任务和参数校验。安装、配置与验证范围见 [Agent 使用说明](docs/AGENT_USAGE.md)。
+
+现已增加 Nano Banana 2.1 文生图、Omni 1.1 Flash 文生视频的浏览器原生模式，可使用专用浏览器中的 Flow 账号，不需要第三方验证码服务。程序在提交前读回模型、比例、数量和点数；默认只允许页面明确显示 0 点数的请求。原生参考图上传暂不支持，已有 RPC 路径继续保留。**当前仅完成离线验证，真实登录、出图、视频和 Agent 客户端调用仍待验收。** 启动与连接步骤见上方使用说明。
+
 <div align="center">
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

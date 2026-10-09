@@ -2,17 +2,97 @@
 
 import json
 import logging
+import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
+from urllib.parse import urlsplit, urlunsplit
 from .config import config
+
+
+REDACTED = "[REDACTED]"
+
+
+def _sensitive_key(key: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    return normalized in {"at", "st", "key", "auth", "sid", "ssid", "hsid", "sapisid", "apisid"} or any(
+        word in normalized for word in (
+            "authorization", "cookie", "password", "passwd", "secret",
+            "apikey", "clientkey", "token", "credential", "sessionid",
+        )
+    )
+
+
+def _redact_data(data: Any) -> Any:
+    if isinstance(data, dict):
+        return {
+            key: REDACTED if (
+                _sensitive_key(str(key)) or (
+                    str(key).lower() in {"encodedimage", "base64", "imagedata", "data"}
+                    and isinstance(value, str)
+                )
+            ) else _redact_data(value)
+            for key, value in data.items()
+        }
+    if isinstance(data, (list, tuple)):
+        return [_redact_data(value) for value in data]
+    if isinstance(data, str):
+        return _redact_text(data)
+    return data
+
+
+def _redact_text(text: str) -> str:
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        return json.dumps(_redact_data(parsed), ensure_ascii=False, indent=2)
+    text = re.sub(r'''data:[^\s,;]+;base64,[^\s"'<>]+''', "data:[REDACTED]", text, flags=re.I)
+    def redact_url(match):
+        try:
+            parsed_url = urlsplit(match.group(0))
+            authority = parsed_url.netloc.rsplit("@", 1)[-1]
+            return urlunsplit((
+                parsed_url.scheme, authority, parsed_url.path,
+                REDACTED if parsed_url.query else "",
+                REDACTED if parsed_url.fragment else "",
+            ))
+        except ValueError:
+            return REDACTED
+    # All query values are omitted: signed URL field names vary by provider.
+    text = re.sub(r'''\b(?:https?|socks5h?|socks4)://[^\s<>"']+''', redact_url, text, flags=re.I)
+    # Protect entire cookie/authorization values, including multiple cookies.
+    text = re.sub(
+        r"(?im)(\b[\w-]*(?:cookie|authorization)[\w-]*\s*[:=]\s*)[^\n]+",
+        lambda match: match.group(1) + REDACTED,
+        text,
+    )
+    text = re.sub(r"(?i)\bBearer\s+[^\s,;\"']+", "Bearer " + REDACTED, text)
+    return re.sub(
+        r'''(?P<key>\b(?:[\w-]*(?:authorization|cookie|password|passwd|secret|api[_-]?key|client[_-]?key|token|credential|session[_-]?id)[\w-]*|at|st|key|auth|sid|ssid|hsid|sapisid|apisid))(?P<sep>["']?\s*(?:返回|值)?\s*[:：=]\s*)(?P<value>\[REDACTED\]|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)''',
+        lambda match: match.group("key") + match.group("sep") + REDACTED,
+        text,
+        flags=re.I,
+    )
+
+
+class _CredentialFilter(logging.Filter):
+    """Final guard applies to every debug log entry, including free-form text."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = _redact_text(record.getMessage())
+        record.args = ()
+        return True
 
 
 class DebugLogger:
     """Debug logger for API requests and responses"""
 
     def __init__(self):
-        self.log_file = Path("logs.txt")
+        self.log_file = Path(os.environ.get("FLOW2API_LOG_PATH") or "logs.txt")
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
         self._setup_logger()
 
     def _setup_logger(self):
@@ -20,6 +100,8 @@ class DebugLogger:
         # Create logger
         self.logger = logging.getLogger("debug_logger")
         self.logger.setLevel(logging.DEBUG)
+        if not any(isinstance(item, _CredentialFilter) for item in self.logger.filters):
+            self.logger.addFilter(_CredentialFilter())
 
         # Remove existing handlers
         self.logger.handlers.clear()
@@ -39,10 +121,8 @@ class DebugLogger:
         self.logger.propagate = False
 
     def _mask_token(self, token: str) -> str:
-        """Mask token for logging (show first 6 and last 6 characters)"""
-        if not config.debug_mask_token or len(token) <= 12:
-            return token
-        return f"{token[:6]}...{token[-6:]}"
+        """Credentials must never be logged, even partially or in debug mode."""
+        return REDACTED
 
     def _format_timestamp(self) -> str:
         """Format current timestamp"""
@@ -109,28 +189,10 @@ class DebugLogger:
 
             # Headers
             self.logger.info("\n📋 Headers:")
-            masked_headers = dict(headers)
-            if "Authorization" in masked_headers or "authorization" in masked_headers:
-                auth_key = (
-                    "Authorization"
-                    if "Authorization" in masked_headers
-                    else "authorization"
-                )
-                auth_value = masked_headers[auth_key]
-                if auth_value.startswith("Bearer "):
-                    token = auth_value[7:]
-                    masked_headers[auth_key] = f"Bearer {self._mask_token(token)}"
-
-            # Mask Cookie header (ST token)
-            if "Cookie" in masked_headers:
-                cookie_value = masked_headers["Cookie"]
-                if "__Secure-next-auth.session-token=" in cookie_value:
-                    parts = cookie_value.split("=", 1)
-                    if len(parts) == 2:
-                        st_token = parts[1].split(";")[0]
-                        masked_headers["Cookie"] = (
-                            f"__Secure-next-auth.session-token={self._mask_token(st_token)}"
-                        )
+            masked_headers = {
+                key: REDACTED if _sensitive_key(str(key)) else value
+                for key, value in headers.items()
+            }
 
             for key, value in masked_headers.items():
                 self.logger.info(f"  {key}: {value}")
