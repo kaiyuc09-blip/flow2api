@@ -15,6 +15,7 @@ import aiosqlite
 
 from .generation_policy import (reset_no_submit_retry, set_no_submit_retry,
                                 reset_native_credit_limit, set_native_credit_limit)
+from .flow_current import start_captcha_call_observation, reset_captcha_call_observation
 
 
 class RequestConflict(ValueError):
@@ -91,15 +92,18 @@ class AgentJobManager:
                 request_hash TEXT NOT NULL, model TEXT NOT NULL,
                 status TEXT NOT NULL, result_json TEXT NOT NULL,
                 created_at REAL NOT NULL, updated_at REAL NOT NULL,
-                max_credits INTEGER NOT NULL DEFAULT 0
+                max_credits INTEGER NOT NULL DEFAULT 0,
+                captcha_call_count INTEGER
             )""")
             columns = await (await db.execute("PRAGMA table_info(agent_generations)")).fetchall()
             if "max_credits" not in {column[1] for column in columns}:
                 await db.execute("ALTER TABLE agent_generations ADD COLUMN max_credits INTEGER NOT NULL DEFAULT 0")
+            if "captcha_call_count" not in {column[1] for column in columns}:
+                await db.execute("ALTER TABLE agent_generations ADD COLUMN captcha_call_count INTEGER")
             interrupted = json.dumps({"media": [], "warnings": [], "error": _failure(
                 "service_restarted", "Service stopped before the result was recorded. The upstream outcome is unknown; do not resubmit automatically.")})
             await db.execute(
-                "UPDATE agent_generations SET status='unknown', result_json=?, updated_at=? WHERE status IN ('queued','running')",
+                "UPDATE agent_generations SET status='unknown', result_json=?, captcha_call_count=NULL, updated_at=? WHERE status IN ('queued','running')",
                 (interrupted, time.time()),
             )
             await db.commit()
@@ -127,6 +131,7 @@ class AgentJobManager:
             "created_at": row["created_at"], "updated_at": row["updated_at"],
             "media": [], "warnings": [], "error": None,
             "upstream_model_verified": False, **result,
+            "captcha_call_count": row["captcha_call_count"],
         }
 
     @staticmethod
@@ -171,11 +176,19 @@ class AgentJobManager:
             task.add_done_callback(self._tasks.discard)
             return await self.get(job_id)
 
-    async def _save(self, job_id, status, result=None):
+    async def _record_captcha_call(self, job_id, count):
         async with aiosqlite.connect(self.db_path, timeout=30) as db:
             await db.execute(
-                "UPDATE agent_generations SET status=?, result_json=?, updated_at=? WHERE id=?",
-                (status, json.dumps(result or {}, ensure_ascii=False), time.time(), job_id),
+                "UPDATE agent_generations SET captcha_call_count=MAX(COALESCE(captcha_call_count,0),?), updated_at=? WHERE id=?",
+                (count, time.time(), job_id),
+            )
+            await db.commit()
+
+    async def _save(self, job_id, status, result=None, captcha_call_count=None):
+        async with aiosqlite.connect(self.db_path, timeout=30) as db:
+            await db.execute(
+                "UPDATE agent_generations SET status=?, result_json=?, captcha_call_count=?, updated_at=? WHERE id=?",
+                (status, json.dumps(result or {}, ensure_ascii=False), captcha_call_count, time.time(), job_id),
             )
             await db.commit()
 
@@ -183,8 +196,16 @@ class AgentJobManager:
         completed = None
         policy_token = set_no_submit_retry(True)
         credit_token = set_native_credit_limit(max_credits)
+        observation, observation_token = start_captcha_call_observation(
+            lambda count: self._record_captcha_call(job_id, count)
+        )
+
+        async def save(status, result=None):
+            await observation.flush()
+            await self._save(job_id, status, result, captcha_call_count=observation.count)
+
         try:
-            await self._save(job_id, "running")
+            await save("running")
             error = None
             async for chunk in self.handler.handle_generation(
                 model=model, prompt=prompt, images=images or None, stream=False,
@@ -214,23 +235,24 @@ class AgentJobManager:
             if completed:
                 if error:
                     completed["warnings"].append({"code": "bookkeeping_failed", "message": "The media was generated, but subsequent bookkeeping reported an error."})
-                await self._save(job_id, "completed", completed)
+                await save("completed", completed)
             elif error:
                 status, public_error = _classify_failure(error)
-                await self._save(job_id, status, {"error": public_error})
+                await save(status, {"error": public_error})
             else:
-                await self._save(job_id, "unknown", {"error": _failure(
+                await save("unknown", {"error": _failure(
                     "missing_media_result", "No structured media result was recorded. Do not resubmit automatically.")})
         except asyncio.CancelledError:
-            await self._save(job_id, "completed" if completed else "unknown", completed or {
+            await save("completed" if completed else "unknown", completed or {
                 "error": _failure("execution_interrupted", "Local processing stopped; the upstream outcome is unknown. Do not resubmit automatically.")})
             raise
         except Exception:
             # Exceptions outside an explicit upstream rejection may occur after
             # submission; do not claim a safe-to-retry failure.
-            await self._save(job_id, "completed" if completed else "unknown", completed or {
+            await save("completed" if completed else "unknown", completed or {
                 "error": _failure("execution_outcome_unknown", "The result could not be recorded. Check Flow before submitting another generation.")})
         finally:
+            reset_captcha_call_observation(observation_token)
             reset_native_credit_limit(credit_token)
             reset_no_submit_retry(policy_token)
 

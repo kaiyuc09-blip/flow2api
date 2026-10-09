@@ -16,6 +16,7 @@ class AgentLifespanTests(unittest.IsolatedAsyncioTestCase):
         settings = copy.deepcopy(main.config.get_raw_config())
         credentials = {"admin_username": "local", "admin_password": "synthetic-password", "api_key": "synthetic-key"}
         settings["global"].update(credentials)
+        settings["server"]["host"] = "127.0.0.1"
         settings["captcha"].update(captcha_method="personal", browser_count=1,
             personal_project_pool_size=1, personal_max_resident_tabs=1)
         browser = AsyncMock()
@@ -28,6 +29,8 @@ class AgentLifespanTests(unittest.IsolatedAsyncioTestCase):
                  patch.object(main.db, "db_path", database), \
                  patch.object(main.agent_jobs, "db_path", database), \
                  patch.object(main.app.state, "native_launch_credentials", credentials, create=True), \
+                 patch.object(main.app.state, "native_launch_workers", 1, create=True), \
+                 patch.object(main.app.state, "native_launch_browser_path", Path(__file__), create=True), \
                  patch.object(BrowserCaptchaService, "get_instance", new=AsyncMock(return_value=browser)) as get_browser:
                 async with main.lifespan(main.app):
                     self.assertIs(main.app.state.personal_browser_service, browser)

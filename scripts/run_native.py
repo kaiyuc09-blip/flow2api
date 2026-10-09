@@ -1,4 +1,4 @@
-"""Start one local native-browser service using a private directory outside Git."""
+"""Start one local Flow2API service using a private directory outside Git."""
 import argparse
 from contextlib import nullcontext
 import json
@@ -138,7 +138,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--private-dir", required=True, type=Path)
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--browser", type=Path, default=Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"))
+    parser.add_argument("--browser", type=Path, default=Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                        help="Installed Chrome executable; required only for saved personal mode")
     parser.add_argument("--prepare-only", action="store_true", help="Create local credential files; do not start a browser or service")
     parser.add_argument("--background", action="store_true", help="Start independently of this terminal on macOS/Linux; wait for the local API to be ready")
     args = parser.parse_args()
@@ -154,8 +155,6 @@ def main():
     print(f"Private runtime prepared: {directory}")
     if args.prepare_only:
         return
-    if not args.browser.is_file():
-        parser.error("An installed Chrome executable is required; this launcher does not install browsers")
     try:
         if args.background:
             pid = start_background(directory, credentials, args.port, args.browser)
@@ -168,7 +167,7 @@ def main():
             run_service(directory, credentials, args)
     except RuntimeError as error:
         # Only launcher errors have safe text; application errors are not printed here.
-        parser.error(str(error) if type(error) is LauncherError else "Could not start the native service. Check the private runtime locally.")
+        parser.error(str(error) if type(error) is LauncherError else "Could not start the local service. Check the private runtime locally.")
 
 
 def run_service(directory, credentials, args):
@@ -189,9 +188,10 @@ def run_service(directory, credentials, args):
     settings = config.get_raw_config()
     settings["global"].update(credentials)
     settings["server"].update(host="127.0.0.1", port=args.port)
-    settings["captcha"].update(captcha_method="personal", browser_count=1, personal_max_resident_tabs=1, personal_project_pool_size=1)
     from src.main import app
     app.state.native_launch_credentials = credentials
+    app.state.native_launch_workers = 1
+    app.state.native_launch_browser_path = args.browser
     import uvicorn
     print(f"Local management: http://127.0.0.1:{args.port}")
     print("Use the private service-credentials.json locally; never paste its values into chat.")

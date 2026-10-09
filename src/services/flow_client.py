@@ -17,7 +17,7 @@ import urllib.request
 from curl_cffi.requests import AsyncSession
 from ..core.logger import debug_logger
 from ..core.config import config, get_yescaptcha_min_score
-from .flow_current import CurrentFlowClientMixin
+from .flow_current import CurrentFlowClientMixin, record_captcha_create_call
 from .flow_frontend import FlowFrontendMixin
 
 try:
@@ -5468,6 +5468,7 @@ class _FlowClientBase(FlowFrontendMixin):
                         request_options["proxy"] = proxy
                     elif proxies:
                         request_options["proxies"] = proxies
+                    await record_captcha_create_call()
                     result = await session.post(
                         f"{base_url.rstrip('/')}/v2/tasks",
                         json=task,
@@ -5527,6 +5528,7 @@ class _FlowClientBase(FlowFrontendMixin):
                     else 1
                 )
                 for create_attempt in range(max_create_attempts):
+                    await record_captcha_create_call()
                     if proxy:
                         result = await session.post(
                             create_url,

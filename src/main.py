@@ -103,6 +103,13 @@ async def lifespan(app: FastAPI):
 
     # Check if database exists (determine if first startup)
     is_first_startup = not db.db_exists()
+    native_credentials = getattr(app.state, "native_launch_credentials", None)
+    if is_first_startup and native_credentials is not None:
+        # Private first-run default only. Existing databases remain authoritative.
+        config_dict = {
+            **config_dict,
+            "flow": {**config_dict.get("flow", {}), "max_retries": 2},
+        }
 
     # Initialize database tables structure
     await db.init_db()
@@ -121,10 +128,12 @@ async def lifespan(app: FastAPI):
 
     # 启动时统一把数据库配置同步到内存，避免 personal/brower 相关运行时配置遗漏。
     await db.reload_config_to_memory()
-    native_credentials = getattr(app.state, "native_launch_credentials", None)
     if native_credentials is not None:
-        from .services.native_runtime import validate_native_runtime_config
-        validate_native_runtime_config(config, native_credentials)
+        from .services.native_runtime import validate_native_runtime_config, validate_personal_browser
+        validate_native_runtime_config(
+            config, native_credentials, workers=getattr(app.state, "native_launch_workers", 1)
+        )
+        validate_personal_browser(config, getattr(app.state, "native_launch_browser_path", None))
     if os.environ.get("FLOW2API_DB_PATH"):
         Path(db.db_path).chmod(0o600)
     await agent_jobs.start()

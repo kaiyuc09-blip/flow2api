@@ -5,10 +5,13 @@ batchexecute.  This mixin overrides every runtime path that previously called
 the retired Labs tRPC and AI Sandbox REST endpoints.
 """
 
+import asyncio
 import base64
 import re
 import time
 import uuid
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -20,6 +23,54 @@ from .model_capabilities import (
     validate_native_image_options, NATIVE_IMAGE_ASPECTS, validate_native_video_options, NATIVE_VIDEO_ASPECTS,
 )
 from .generation_policy import submission_attempts, raise_if_submission_uncertain, GenerationOutcomeUnknown, get_native_credit_limit
+
+
+@dataclass
+class CaptchaCallObservation:
+    """Observed create-task dispatches, not provider billing or result polls."""
+
+    persist: Optional[Callable[[int], Awaitable[None]]] = None
+    count: Optional[int] = None
+    pending: set = field(default_factory=set)
+
+    async def _persist(self, count):
+        try:
+            await self.persist(count)
+        except Exception:
+            debug_logger.log_warning("Captcha call count persistence unavailable")
+
+    async def flush(self):
+        if self.pending:
+            await asyncio.gather(*tuple(self.pending))
+
+
+_captcha_call_observation: ContextVar[Optional[CaptchaCallObservation]] = ContextVar(
+    "flow_captcha_call_observation", default=None
+)
+
+
+def start_captcha_call_observation(persist=None):
+    observation = CaptchaCallObservation(persist=persist)
+    return observation, _captcha_call_observation.set(observation)
+
+
+def reset_captcha_call_observation(token):
+    _captcha_call_observation.reset(token)
+
+
+async def record_captcha_create_call():
+    """Call only at a provider create-task dispatch; pass no credential data."""
+    observation = _captcha_call_observation.get()
+    if observation is None:
+        return
+    observation.count = (observation.count or 0) + 1
+    if observation.persist is not None:
+        # Do not delay or cancel the provider dispatch on database I/O. The job
+        # drains these writes before its final result; crash recovery uses null.
+        task = asyncio.create_task(observation._persist(observation.count))
+        observation.pending.add(task)
+        task.add_done_callback(observation.pending.discard)
+
 
 class CurrentFlowClientMixin:
     FRONTEND_ACCESS_TOKEN = "flow-frontend-cookie"

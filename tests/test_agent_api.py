@@ -70,12 +70,12 @@ class AgentApiTests(unittest.IsolatedAsyncioTestCase):
         }, headers={"Authorization": "Bearer wrong-test-only"})
         self.assertEqual(response.status_code, 401)
 
-    async def test_capability_catalog_keeps_new_model_honest(self):
+    async def test_rpc_capability_catalog_omits_native_ui_models(self):
         response = await self.client.get("/v1/agent/models", headers=self.headers)
         self.assertEqual(response.status_code, 200)
-        newest = next(item for item in response.json()["data"] if item["id"] == "gemini-nano-banana-2.1")
-        self.assertFalse(newest["available"])
-        self.assertEqual(newest["verification_state"], "needs_protocol_verification")
+        ids = {item["id"] for item in response.json()["data"]}
+        self.assertIn("gemini-3.1-flash-image-square", ids)
+        self.assertFalse(any(model.startswith(("gemini-nano-banana-2.1", "native-omni-1.1-flash-")) for model in ids))
 
     async def test_unverified_model_is_rejected_before_submission(self):
         response = await self.client.post("/v1/agent/generations", headers=self.headers, json={

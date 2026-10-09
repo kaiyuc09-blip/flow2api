@@ -188,8 +188,10 @@ def get_model_capabilities() -> list[dict[str, Any]]:
     # Import lazily so the handler can use the transport preflight before uploads.
     from .generation_handler import MODEL_CONFIG
 
+    native_ui_enabled = config.captcha_method == "personal"
     entries = [_capability(model_id, model) for model_id, model in MODEL_CONFIG.items()
-               if model.get("listed", True)]
+               if model.get("listed", True)
+               and (native_ui_enabled or model.get("generation_transport") != "native_ui")]
     return entries
 
 

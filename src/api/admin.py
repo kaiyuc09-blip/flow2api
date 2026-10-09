@@ -36,6 +36,7 @@ from ..core.monitoring import build_public_health_snapshot
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
 from ..services.concurrency_manager import ConcurrencyManager
+from ..services.model_capabilities import THIRD_PARTY_CAPTCHA_METHODS
 
 try:
     import httpx
@@ -2676,7 +2677,8 @@ async def plugin_update_token(
 ):
     """Validate and store credentials pushed by Token Updater 1.3+."""
     await _verify_plugin_connection_token(authorization)
-    await _reject_manual_changes_to_native_accounts()
+    if config.captcha_method not in THIRD_PARTY_CAPTCHA_METHODS:
+        await _reject_manual_changes_to_native_accounts()
     plugin_config = await db.get_plugin_config()
 
     google_cookies = request.google_cookies

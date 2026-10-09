@@ -37,13 +37,11 @@ class ModelCapabilitiesTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "3"):
                 model_capabilities.validate_generation_request("omni-1.1-flash-10s-portrait", 4)
 
-    def test_new_model_requires_protocol_evidence_before_generation(self):
+    def test_native_model_is_not_offered_on_rpc_transport(self):
         with patch.object(config, "_config", {"captcha": {"captcha_method": "yescaptcha", "yescaptcha_api_key": "test-only"}}):
-            model = next(item for item in model_capabilities.get_model_capabilities()
-                         if item["id"] == "gemini-nano-banana-2.1")
-            self.assertFalse(model["available"])
-            self.assertEqual(model["verification_state"], "needs_protocol_verification")
-            with self.assertRaisesRegex(ValueError, "protocol|协议"):
+            ids = {item["id"] for item in model_capabilities.get_model_capabilities()}
+            self.assertNotIn("gemini-nano-banana-2.1", ids)
+            with self.assertRaisesRegex(ValueError, "不支持的模型"):
                 model_capabilities.validate_generation_request("gemini-nano-banana-2.1", 0)
 
 
