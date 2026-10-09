@@ -37,6 +37,8 @@ uv pip install --python ../venv/bin/python -r requirements-agent.txt
   --port 8000
 ```
 
+上面是前台运行，关闭启动终端或启动它的 Agent 可能使服务退出。macOS/Linux 日常使用可在命令末尾增加 `--background`：服务独立于启动终端运行，只有带鉴权的模型目录检查成功后才报告就绪。它不会注册开机自启，电脑重启后仍需启动一次。再次运行同一命令会复用已就绪的服务；同一私有目录有进程正在启动时，文件锁会阻止第二个服务打开浏览器。启动超时会报告未确认和进程号，不自动重复启动；不要据此提交生成。
+
 `--private-dir` 必须在仓库外，首次使用新的空目录。只准备本地目录和随机凭证、不启动浏览器和 HTTP 服务时，在同一命令后增加 `--prepare-only`。需要已安装的 Chrome；macOS 默认可执行文件为 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`，其他位置或系统通过 `--browser '/absolute/path/to/chrome'` 指定。启动器不会自动安装 Chrome 或依赖。
 
 私有目录内的文件用途如下，不能提交到 Git 或粘贴到聊天：
@@ -47,11 +49,14 @@ uv pip install --python ../venv/bin/python -r requirements-agent.txt
 | `api-key.txt` | 供 MCP 的 `FLOW2API_API_KEY_FILE` 读取，不是 Google 登录态。 |
 | `browser-profile/`、`flow.db` | 专用浏览器资料及本机账号、设置、任务数据库。 |
 | `cache/`、`service.log` | 服务缓存与本机运行日志。 |
+| `service.lock` | macOS/Linux 服务单实例锁，防止同时操作同一数据库和专用浏览器；进程退出后自动释放，不需要删除文件。 |
 | `media/` | 建议作为 MCP 的 `FLOW2API_OUTPUT_DIR`，保存交付文件。 |
 
 服务只监听本机。启动后，在它打开的**专用浏览器窗口**登录 Google Flow 并打开一个已有项目；再访问 [本机管理页](http://127.0.0.1:8000)，使用私有凭证文件中的管理账号登录，点击“连接原生浏览器账号”。如果更改了端口，管理页地址同步更改。只支持一个账号；连接按钮将该窗口的登录态保存到本机，用于之后的请求，不生成素材，不显示或导出凭证。
 
 重启时继续使用同一个私有目录。若数据库中的设置或凭证与专用启动配置不一致，启动明确拒绝；不会为了启动而覆盖已有配置或重新生成密钥。先核对原目录和配置，勿删除数据库或替换私有凭证来绕过错误。
+
+如果服务异常退出、其专用 Chrome 窗口仍留在后台，同一资料目录可能阻止新的浏览器连接。仅关闭这套服务自己的专用窗口后再启动，保留资料目录；不要结束所有 Chrome 进程或删除资料目录。
 
 只有可用 Flow 账号、没有第三方验证码服务时，可将服务的验证码模式设为 `personal`，使用下面的原生模型目录。原生模式仍需要本地受控浏览器中的有效 Flow 登录状态；MCP 不自动获取或导出登录凭证。
 
